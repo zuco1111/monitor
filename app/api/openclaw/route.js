@@ -73,7 +73,12 @@ function getSessionFileCreatedTime(filePath) {
   }
 }
 
-// 计算今日Token消耗（持久化设计：删除 session 不影响历史今日 token）
+/* 
+// ============================================================================
+// 注释掉的旧版本：方案3 - 只计算今日消息的token增量
+// 存在问题：重置对话时会减少今日token消耗，不符合需求
+// 需求：今日token消耗不受重置对话、删除对话、删除session影响
+// ============================================================================
 async function calculateTodayTokens() {
   const homeDir = os.homedir();
   const sessionsDir = path.join(homeDir, '.openclaw', 'agents', 'main', 'sessions');
@@ -84,12 +89,167 @@ async function calculateTodayTokens() {
   
   // 检查是否需要重置（跨天）
   if (storage.lastResetDate !== today) {
-    // 新的一天，重置数据
     storage.daily = {};
     storage.daily[today] = { total: 0, sessions: {} };
     storage.lastResetDate = today;
     await saveDailyTokenStorage(storage);
-    // 返回 0
+    return { todayTokens: 0 };
+  }
+  
+  if (!storage.daily[today]) {
+    storage.daily[today] = { total: 0, sessions: {} };
+  }
+  
+  const todayData = storage.daily[today];
+  
+  if (!fs.existsSync(sessionsDir)) {
+    return { todayTokens: todayData.total };
+  }
+  
+  let todayTotal = 0;
+  const currentSessions = {};
+  const deletedSessions = { ...todayData.sessions };
+  
+  try {
+    const files = fs.readdirSync(sessionsDir);
+    
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue;
+      
+      const sessionId = file.replace('.jsonl', '');
+      const filePath = path.join(sessionsDir, file);
+      const fileCreatedTime = getSessionFileCreatedTime(filePath);
+      const existingSessionData = todayData.sessions?.[sessionId];
+      
+      const isRebuilt = existingSessionData && existingSessionData.fileCreated !== fileCreatedTime;
+      
+      if (existingSessionData && !isRebuilt) {
+        delete deletedSessions[sessionId];
+      } else if (isRebuilt) {
+        deletedSessions[sessionId] = existingSessionData;
+      }
+      
+      const tokenInfo = getTodayTokenIncrement(filePath, todayStart);
+      
+      if (tokenInfo.increment > 0) {
+        todayTotal += tokenInfo.increment;
+      }
+      
+      currentSessions[sessionId] = {
+        lastTokens: tokenInfo.currentTokens,
+        firstTodayTokens: tokenInfo.firstTodayTokens,
+        fileCreated: fileCreatedTime,
+        lastUpdate: Date.now()
+      };
+    }
+    
+    for (const [sessionId, sessionData] of Object.entries(deletedSessions)) {
+      const firstTodayTokens = sessionData.firstTodayTokens || 0;
+      const lastTokens = sessionData.lastTokens || 0;
+      const todayIncrement = Math.max(0, lastTokens - firstTodayTokens);
+      if (todayIncrement > 0) {
+        todayTotal += todayIncrement;
+        console.log(`[Token] Session ${sessionId} deleted, preserved ${todayIncrement} tokens`);
+      }
+    }
+    
+    storage.daily[today].sessions = currentSessions;
+    if (storage.daily[today].total !== todayTotal) {
+      storage.daily[today].total = todayTotal;
+      await saveDailyTokenStorage(storage);
+    }
+    
+  } catch (e) {
+    console.error('Error calculating today tokens:', e);
+  }
+  
+  return { todayTokens: todayTotal };
+}
+
+function getTodayTokenIncrement(sessionFilePath, todayStart) {
+  try {
+    const stats = fs.statSync(sessionFilePath);
+    if (stats.size === 0) {
+      return { increment: 0, currentTokens: 0, firstTodayTokens: null };
+    }
+    
+    const content = fs.readFileSync(sessionFilePath, 'utf-8');
+    const lines = content.split('\n').filter(l => l.trim());
+    
+    let increment = 0;
+    let lastTokens = 0;
+    let currentTokens = 0;
+    let firstTodayTokens = null;
+    
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line);
+        const msgTime = obj.message?.timestamp || 0;
+        
+        if (obj.type === 'message' && obj.message?.usage?.totalTokens) {
+          const msgTokens = obj.message.usage.totalTokens;
+          currentTokens = msgTokens;
+          
+          if (msgTime >= todayStart) {
+            if (firstTodayTokens === null) {
+              firstTodayTokens = msgTokens;
+              lastTokens = msgTokens;
+            } else {
+              if (msgTokens > lastTokens) {
+                increment += (msgTokens - lastTokens);
+              }
+              lastTokens = msgTokens;
+            }
+          }
+        }
+      } catch (e) {}
+    }
+    
+    return { increment, currentTokens, firstTodayTokens };
+  } catch (e) {
+    return { increment: 0, currentTokens: 0, firstTodayTokens: null };
+  }
+}
+// ============================================================================
+*/
+
+
+// ============================================================================
+// 方案4 - 分离历史基准 (historyBaseline)
+// 设计原则：
+// 1. 每天0点重置，重新计算今日token消耗
+// 2. 每个session记录 historyBaseline（历史基准token）
+// 3. 今日token消耗 = 当前token - historyBaseline
+// 4. 重置对话不影响：重置后currentTokens减少，但historyBaseline不变，差值不变
+// 5. 删除session不影响：删除时保留其 historyBaseline，后续仍计入
+// ============================================================================
+
+async function calculateTodayTokens() {
+  const homeDir = os.homedir();
+  const sessionsDir = path.join(homeDir, '.openclaw', 'agents', 'main', 'sessions');
+  
+  const storage = loadDailyTokenStorage();
+  const today = getTodayDateString();
+  const yesterday = getYesterdayDateString();
+  
+  // 检查是否需要跨天重置
+  if (storage.lastResetDate !== today) {
+    // 新的一天到来
+    // 1. 将昨天的 historyBaseline 更新为昨天最终的 currentTokens
+    if (storage.daily[yesterday]) {
+      for (const [sessionId, sessionData] of Object.entries(storage.daily[yesterday].sessions || {})) {
+        if (sessionData.currentTokens > 0) {
+          // 将昨日最终的 currentTokens 作为今日的 historyBaseline
+          // 注意：新结构中 historyBaseline 会在下面计算时自动设置
+        }
+      }
+    }
+    
+    // 2. 重置今日数据
+    storage.daily = {};
+    storage.daily[today] = { total: 0, sessions: {} };
+    storage.lastResetDate = today;
+    await saveDailyTokenStorage(storage);
     return { todayTokens: 0 };
   }
   
@@ -104,11 +264,11 @@ async function calculateTodayTokens() {
     return { todayTokens: todayData.total };
   }
   
-  // 从 0 开始计算今日总增量（不累加历史）
+  // 计算今日总token消耗
   let todayTotal = 0;
   const currentSessions = {};
   
-  // 记录所有被删除但有记录的 session，用于保留其累积 token
+  // 记录已删除的session（用于保留其历史基准）
   const deletedSessions = { ...todayData.sessions };
   
   try {
@@ -119,95 +279,60 @@ async function calculateTodayTokens() {
       
       const sessionId = file.replace('.jsonl', '');
       const filePath = path.join(sessionsDir, file);
-      const fileCreatedTime = getSessionFileCreatedTime(filePath);
+      const currentTokens = getFinalTokensFromSession(filePath);
+      
       const existingSessionData = todayData.sessions?.[sessionId];
       
-      // 从 deletedSessions 中移除当前存在的 session
-      delete deletedSessions[sessionId];
+      // 检查session是否被删除后重建（通过文件创建时间判断）
+      const fileCreatedTime = getSessionFileCreatedTime(filePath);
+      const isRebuilt = existingSessionData && existingSessionData.fileCreated !== fileCreatedTime;
       
-      // 修复：检测 session 是否被删除后重建（通过文件创建时间判断）
-      // 如果文件创建时间与记录的创建时间不同，说明是同名但不同的 session，应视为新 session
-      let sessionBaseline = existingSessionData;
-      if (existingSessionData && existingSessionData.fileCreated !== fileCreatedTime) {
-        // session 被删除后重建了同名 session，需要保留旧的今日增量 token
-        // 今日增量 = lastTokens - baselineTokens
-        const oldBaselineTokens = existingSessionData.baselineTokens || 0;
-        const oldLastTokens = existingSessionData.lastTokens || 0;
-        const oldTodayIncrement = Math.max(0, oldLastTokens - oldBaselineTokens);
-        if (oldTodayIncrement > 0) {
-          todayTotal += oldTodayIncrement;
-          console.log(`[Token] Session ${sessionId} recreated, preserving ${oldTodayIncrement} tokens from old session`);
-        }
-        // 新的 session 从 0 开始计算
-        sessionBaseline = { lastTokens: 0, initialTokens: 0, baselineTokens: 0, fileCreated: fileCreatedTime };
+      if (existingSessionData && !isRebuilt) {
+        // 正常存在的session，从deletedSessions中移除
+        delete deletedSessions[sessionId];
+      } else if (isRebuilt) {
+        // session被删除后重建了同名session，保留其历史基准
+        deletedSessions[sessionId] = existingSessionData;
       }
       
-      // 计算该 session 从 0 点到现在的 token 增量
-      const tokenInfo = getTodayTokensFromSessionWithBaseline(
-        filePath, 
-        todayStart, 
-        sessionBaseline || { lastTokens: 0, initialTokens: 0, baselineTokens: 0, fileCreated: fileCreatedTime }
-      );
+      // 确定该session的historyBaseline
+      // 优先使用已记录的historyBaseline，如果没有则用当前token（首次计算时）
+      let historyBaseline = existingSessionData?.historyBaseline;
       
-      if (tokenInfo.increment > 0) {
-        todayTotal += tokenInfo.increment;
+      if (historyBaseline === undefined || historyBaseline === null) {
+        // 首次计算或跨天后的首次计算，使用当前token作为基准
+        historyBaseline = currentTokens;
       }
       
-      // 记录当前 session 的 token 状态（用于下次计算增量）
-      // 修复2：记录 initialTokens，用于检测 reset
-      let initialTokens = existingSessionData?.initialTokens || 0;
-      let baselineTokens = existingSessionData?.baselineTokens || 0;
-      if (tokenInfo.isReset || !existingSessionData || (existingSessionData && existingSessionData.fileCreated !== fileCreatedTime)) {
-        // session 被 reset、新 session 或同名重建，记录初始 token
-        initialTokens = tokenInfo.currentTokens;
-        // baselineTokens：
-        // - 今天新建的 session（fileCreatedToday = true）用 0
-        // - 今天之前创建且今日有消息的 session 用今日第一条消息的 token
-        // - 今天之前创建且今日无消息的 session 用 currentTokens（保持不变）
-        if (tokenInfo.firstTodayTokens !== null) {
-          baselineTokens = tokenInfo.firstTodayTokens;
-        } else {
-          // 今日无新消息，保持当前 token 作为 baseline
-          baselineTokens = tokenInfo.currentTokens;
-        }
-      } else {
-        // 已存在的 session（有记录且未被重建）
-        // 如果今日有新消息，更新为今日第一条消息的 token
-        if (tokenInfo.firstTodayTokens !== null) {
-          baselineTokens = tokenInfo.firstTodayTokens;
-        } else if (baselineTokens === 0 && tokenInfo.currentTokens > 0) {
-          // 修复：旧数据 baselineTokens = 0 的边界情况
-          // 如果今日无新消息且 baselineTokens 为 0，设为 currentTokens
-          baselineTokens = tokenInfo.currentTokens;
-        }
-        // 如果今日无新消息且 baselineTokens > 0，保持不变
+      // 今日token消耗 = 当前token - 历史基准（不能为负）
+      const todayIncrement = Math.max(0, currentTokens - historyBaseline);
+      if (todayIncrement > 0) {
+        todayTotal += todayIncrement;
       }
       
+      // 记录当前session状态
       currentSessions[sessionId] = {
-        lastTokens: tokenInfo.currentTokens,
-        initialTokens: initialTokens,
-        baselineTokens: baselineTokens,
+        currentTokens: currentTokens,
+        historyBaseline: historyBaseline,  // 保持不变，除非跨天
         fileCreated: fileCreatedTime,
         lastUpdate: Date.now()
       };
     }
     
-    // 将被删除的 session 的今日增量累积到今日总量
-    // 修复：只计算今日新增的 token，而不是全量
-    // 今日新增 = lastTokens - baselineTokens
+    // 处理已删除的session：保留其历史基准对应的token消耗
     for (const [sessionId, sessionData] of Object.entries(deletedSessions)) {
-      const baselineTokens = sessionData.baselineTokens || 0;
-      const lastTokens = sessionData.lastTokens || 0;
-      const todayIncrement = Math.max(0, lastTokens - baselineTokens);
+      const historyBaseline = sessionData.historyBaseline || 0;
+      const currentTokens = sessionData.currentTokens || 0;
+      // 使用其历史基准计算今日消耗
+      const todayIncrement = Math.max(0, currentTokens - historyBaseline);
       if (todayIncrement > 0) {
         todayTotal += todayIncrement;
-        console.log(`[Token] Session ${sessionId} deleted, adding ${todayIncrement} tokens (was ${baselineTokens}, now ${lastTokens})`);
+        console.log(`[Token] Session ${sessionId} deleted, preserved ${todayIncrement} tokens`);
       }
     }
     
-    // 更新存储（异步保存）
+    // 保存更新后的数据
     storage.daily[today].sessions = currentSessions;
-    // 只有 total 变化时才更新（避免频繁写入）
     if (storage.daily[today].total !== todayTotal) {
       storage.daily[today].total = todayTotal;
       await saveDailyTokenStorage(storage);
@@ -220,84 +345,13 @@ async function calculateTodayTokens() {
   return { todayTokens: todayTotal };
 }
 
-// 从session文件中提取今日token消耗（带增量基准）
-// 修复2：检测 session 是否被 reset，避免历史 token 重复计入今日
-function getTodayTokensFromSessionWithBaseline(sessionFilePath, todayStart, baselineData) {
-  // baselineData: { lastTokens: number, initialTokens: number, baselineTokens: number, fileCreated: number }
-  const baselineTokens = baselineData?.lastTokens || 0;
-  const initialTokens = baselineData?.initialTokens || 0;
-  const fileCreatedTime = baselineData?.fileCreated || 0;
-  
-  try {
-    const stats = fs.statSync(sessionFilePath);
-    if (stats.size === 0) return { increment: 0, currentTokens: 0, isReset: false };
-    
-    const content = fs.readFileSync(sessionFilePath, 'utf-8');
-    const lines = content.split('\n').filter(l => l.trim());
-    
-    // 检查文件是否在今天之前创建
-    const fileCreatedToday = fileCreatedTime >= todayStart;
-    
-    let todayIncrement = 0;
-    let lastTokens = 0;
-    let currentTokens = 0;
-    let foundToday = false;
-    let firstTodayTokens = null;
-    
-    // 修复2：如果文件不是今天创建的，但 currentTokens < initialTokens，说明被 reset 了
-    // 此时用 initialTokens（或第一条消息的 token）作为今日起点
-    let effectiveBaseline = baselineTokens;
-    if (!fileCreatedToday && initialTokens > 0 && baselineTokens > initialTokens) {
-      // session 被 reset 了，用当前文件的初始 token 作为基准
-      effectiveBaseline = 0; // 从 0 开始计算
-    }
-    
-    for (const line of lines) {
-      try {
-        const obj = JSON.parse(line);
-        const msgTime = obj.message?.timestamp || 0;
-        
-        if (obj.type === 'message' && obj.message?.usage?.totalTokens) {
-          currentTokens = obj.message.usage.totalTokens;
-          
-          if (msgTime >= todayStart) {
-            if (!foundToday) {
-              // 今日第一条消息
-              foundToday = true;
-              // 如果是被 reset 的 session，使用该消息的 token 作为今日起点
-              if (!fileCreatedToday && baselineTokens > initialTokens) {
-                firstTodayTokens = currentTokens;
-              } else {
-                firstTodayTokens = effectiveBaseline > 0 ? effectiveBaseline : currentTokens;
-              }
-              lastTokens = currentTokens;
-            } else {
-              // 后续消息，只累加正值增量
-              if (currentTokens > lastTokens) {
-                todayIncrement += (currentTokens - lastTokens);
-              }
-              lastTokens = currentTokens;
-            }
-          }
-        }
-      } catch (e) {
-        // 跳过解析失败的行
-      }
-    }
-    
-    // 如果没有今天的消息，但有 baseline，用 baseline 计算
-    if (!foundToday && baselineTokens > 0 && currentTokens > baselineTokens) {
-      todayIncrement = currentTokens - baselineTokens;
-    }
-    
-    // 返回是否被 reset 的标志
-    const isReset = !fileCreatedToday && baselineTokens > initialTokens && currentTokens < baselineTokens;
-    
-    return { increment: todayIncrement, currentTokens, isReset, firstTodayTokens };
-  } catch (e) {
-    return { increment: 0, currentTokens: 0, isReset: false, firstTodayTokens: null };
-  }
+// 获取昨天的日期字符串
+function getYesterdayDateString() {
+  const now = new Date();
+  now.setDate(now.getDate() - 1);
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 }
+// ============================================================================
 
 // 简单内存缓存
 let cachedResult = null;

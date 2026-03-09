@@ -1,6 +1,12 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  /* config options here */
+  turbopack: {},
+  webpack: (config, { isServer }) => {
+    if (isServer) {
+      config.externals = [...(config.externals || []), 'ssh2'];
+    }
+    return config;
+  },
 };
 
 export default nextConfig;
