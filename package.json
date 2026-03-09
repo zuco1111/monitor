@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 3344",
-    "build": "next build",
+    "build": "next build --webpack",
     "start": "next start -p 3344",
     "lint": "eslint",
     "stop": "lsof -ti :3344 | xargs kill"
@@ -15,7 +15,7 @@
     "cron-parser": "^5.5.0",
     "dockerode": "^4.0.9",
     "lucide-react": "^0.577.0",
-    "next": "16.1.6",
+    "next": "^16.1.6",
     "radix-ui": "^1.4.3",
     "react": "19.2.3",
     "react-dom": "19.2.3",

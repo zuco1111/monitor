@@ -1,14 +1,11 @@
 import { NextResponse } from 'next/server';
-import Docker from 'dockerode';
-
-export const dynamic = 'force-dynamic';
 
 // Docker 实例缓存（按需创建，不用则销毁）
 let dockerInstance = null;
 let dockerInstanceTime = 0;
 const DOCKER_TTL = 30000; // 30秒复用
 
-function getDocker() {
+async function getDocker() {
   const now = Date.now();
   // 如果超过 TTL 或者实例无效，重新创建
   if (!dockerInstance || (now - dockerInstanceTime) > DOCKER_TTL) {
@@ -20,6 +17,8 @@ function getDocker() {
     } catch (e) {
       // 忽略销毁错误
     }
+    // 动态导入 dockerode，延迟加载避免 Turbopack 构建问题
+    const Docker = (await import('dockerode')).default;
     dockerInstance = new Docker();
     dockerInstanceTime = now;
   }
@@ -48,7 +47,7 @@ async function dockerWithRetry(fn, maxRetries = 2) {
 export async function GET() {
   try {
     // 使用连接池（带重试）
-    const docker = getDocker();
+    const docker = await getDocker();
 
     // 获取所有容器（包括未运行的）
     const containers = await dockerWithRetry(() => docker.listContainers({ all: true }));

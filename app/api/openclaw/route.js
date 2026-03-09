@@ -72,7 +72,6 @@ function getYesterdayDateString() {
 async function calculateTodayTokens() {
   const storage = loadDailyTokenStorage();
   const today = getTodayDateString();
-  const yesterday = getYesterdayDateString();
   
   // 获取当前历史总消耗
   const currentTotal = getCachedTokens();
@@ -80,7 +79,7 @@ async function calculateTodayTokens() {
   // 检查是否需要跨天更新
   if (storage.lastUpdateDate !== today) {
     if (storage.lastUpdateDate === null) {
-      // 首次运行：yesterdayTotal 设为 0
+      // 首次运行：yesterdayTotal 设为 0，今日 token = 当前总消耗 - 0 = 当前总消耗
       storage.yesterdayTotal = 0;
     }
     // 跨多天的情况：保持原来的 yesterdayTotal 不变（用之前的值作为基准）
@@ -88,11 +87,14 @@ async function calculateTodayTokens() {
     storage.lastUpdateDate = today;
     await saveDailyTokenStorage(storage);
     
-    console.log(`[Token] Day change detected, yesterdayTotal: ${storage.yesterdayTotal}`);
-    return { todayTokens: 0 };
+    console.log(`[Token] Day change, yesterdayTotal: ${storage.yesterdayTotal}, currentTotal: ${currentTotal}`);
+    
+    // 首次运行或跨天：今日 token = currentTotal - yesterdayTotal
+    const todayTokens = Math.max(0, currentTotal - storage.yesterdayTotal);
+    return { todayTokens };
   }
   
-  // 今日 token = 当前历史总消耗 - 昨日历史总消耗
+  // 正常计算：今日 token = 当前历史总消耗 - 昨日历史总消耗
   const todayTokens = Math.max(0, currentTotal - storage.yesterdayTotal);
   
   return { todayTokens };
