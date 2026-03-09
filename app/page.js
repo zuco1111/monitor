@@ -90,6 +90,10 @@ export default function Home() {
   const [sessionsList, setSessionsList] = useState([]);
   const [selectedSession, setSelectedSession] = useState(null);
   const [conversationMessages, setConversationMessages] = useState([]);
+  
+  // 消息缓存限制，防止内存泄漏
+  const MAX_CACHED_MESSAGES = 50;
+  const MAX_SESSION_LIST = 20;
 
   // 主题切换
   const toggleTheme = () => {
@@ -138,14 +142,16 @@ export default function Home() {
     }
   };
 
-  // 首次加载时获取会话列表
+  // 首次加载时获取会话列表（带缓存限制）
   const fetchSessionsList = async () => {
     try {
       const data = await fetch('/api/openclaw/conversations').then(r => r.json());
       if (data.sessions && data.sessions.length > 0) {
-        setSessionsList(data.sessions);
+        // 限制会话列表数量，防止内存泄漏
+        const limitedSessions = data.sessions.slice(0, MAX_SESSION_LIST);
+        setSessionsList(limitedSessions);
         if (!selectedSession) {
-          setSelectedSession(data.sessions[0].key);
+          setSelectedSession(limitedSessions[0].key);
         }
       }
     } catch (e) {
@@ -153,21 +159,75 @@ export default function Home() {
     }
   };
 
-  // 获取指定会话的消息
-  const fetchSessionMessages = async (sessionKey) => {
+  // 记录最后一条消息的时间戳，用于增量获取
+  const lastMessageTimestampRef = useRef(0);
+  // 记录上一次 fetch 的 isReset 状态
+  const lastResetStatusRef = useRef(false);
+
+  // 获取指定会话的消息（增量更新）
+  const fetchSessionMessages = useCallback(async (sessionKey, isFullFetch = false) => {
     if (!sessionKey) return;
+    
     try {
-      const data = await fetch(`/api/openclaw/conversations?session=${encodeURIComponent(sessionKey)}`).then(r => r.json());
-      setConversationMessages(data.messages || []);
+      // 如果是全量获取（首次加载），不带 after 参数
+      // 如果是增量获取，带 after 参数只获取新消息
+      const url = isFullFetch 
+        ? `/api/openclaw/conversations?session=${encodeURIComponent(sessionKey)}`
+        : `/api/openclaw/conversations?session=${encodeURIComponent(sessionKey)}&after=${lastMessageTimestampRef.current}`;
+      
+      const data = await fetch(url).then(r => r.json());
+      
+      // 检查是否被 reset，如果是则清空消息重新获取
+      if (data.isReset && !lastResetStatusRef.current && !isFullFetch) {
+        // 检测到 reset，清空消息并重新全量获取
+        lastResetStatusRef.current = true;
+        setConversationMessages([]);
+        lastMessageTimestampRef.current = 0;
+        
+        const resetUrl = `/api/openclaw/conversations?session=${encodeURIComponent(sessionKey)}`;
+        const resetData = await fetch(resetUrl).then(r => r.json());
+        const resetMessages = (resetData.messages || []).slice(0, MAX_CACHED_MESSAGES);
+        setConversationMessages(resetMessages);
+        if (resetMessages.length > 0) {
+          lastMessageTimestampRef.current = resetMessages[resetMessages.length - 1]?.timestamp || 0;
+        }
+        return;
+      }
+      
+      // 更新 reset 状态
+      lastResetStatusRef.current = data.isReset || false;
+      
+      if (isFullFetch) {
+        // 全量获取：直接替换
+        const limitedMessages = (data.messages || []).slice(0, MAX_CACHED_MESSAGES);
+        setConversationMessages(limitedMessages);
+        // 记录最后一条消息的时间戳
+        if (limitedMessages.length > 0) {
+          lastMessageTimestampRef.current = limitedMessages[limitedMessages.length - 1].timestamp || 0;
+        }
+      } else {
+        // 增量获取：追加新消息
+        const newMessages = data.messages || [];
+        if (newMessages.length > 0) {
+          setConversationMessages(prev => {
+            const combined = [...prev, ...newMessages].slice(0, MAX_CACHED_MESSAGES);
+            // 更新最后一条消息的时间戳
+            lastMessageTimestampRef.current = combined[combined.length - 1]?.timestamp || 0;
+            return combined;
+          });
+        }
+      }
     } catch (e) {
       console.error('Failed to fetch messages:', e);
-      setConversationMessages([]);
+      if (isFullFetch) {
+        setConversationMessages([]);
+      }
     }
-  };
+  }, []);
 
-  // 对话智能滚动 Hook
+  // 对话智能滚动 Hook - 增量更新
   const { scrollRef: messagesScrollRef, handleUserActivity: handleMessagesActivity } = useSmartScroll(
-    () => selectedSession ? fetchSessionMessages(selectedSession) : Promise.resolve()
+    useCallback(() => selectedSession ? fetchSessionMessages(selectedSession, false) : Promise.resolve(), [selectedSession, fetchSessionMessages])
   );
 
   // 日志智能滚动 Hook
@@ -188,9 +248,19 @@ export default function Home() {
   // 当选中会话变化时，获取该会话的消息
   useEffect(() => {
     if (selectedSession) {
-      fetchSessionMessages(selectedSession);
+      // 首次加载时全量获取，后续增量更新
+      fetchSessionMessages(selectedSession, true);
     }
-  }, [selectedSession]);
+  }, [selectedSession, fetchSessionMessages]);
+
+  // 组件卸载时清理数据，防止内存泄漏
+  useEffect(() => {
+    return () => {
+      setConversationMessages([]);
+      setSessionsList([]);
+      setSelectedSession(null);
+    };
+  }, []);
 
   // 计算状态颜色
   const getStatusColor = (status) => {
@@ -232,17 +302,17 @@ export default function Home() {
         </div>
       </div>
 
-      {/* 系统状态一行 - 7个卡片 */}
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 mb-6">
+      {/* 系统状态一行 - 自适应卡片 */}
+      <div className={`grid gap-3 mb-6 ${systemData?.temperature?.cpu ? 'grid-cols-2 md:grid-cols-4 lg:grid-cols-8' : 'grid-cols-2 md:grid-cols-3 lg:grid-cols-7'}`}>
         {/* CPU */}
         <Card className="bg-white/80 dark:bg-slate-800/80 backdrop-blur shadow-lg border-0">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardHeader className="flex flex-row items-center justify-between pb-0">
             <CardTitle className="text-sm font-medium text-gray-600 dark:text-gray-300">CPU</CardTitle>
             <Cpu className="w-4 h-4 text-indigo-500" />
           </CardHeader>
-          <CardContent>
+          <CardContent className="pt-0 -mt-1">
             <div className="text-2xl font-bold text-indigo-600">{formatPercent(systemData?.cpu?.load)}</div>
-            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+            <p className="text-xs text-gray-500 dark:text-gray-400">
               {systemData?.cpu?.brand?.substring(0, 20) || 'CPU'} • {systemData?.cpu?.coresCount} 核
             </p>
           </CardContent>
@@ -250,13 +320,13 @@ export default function Home() {
 
         {/* 内存 */}
         <Card className="bg-white/80 dark:bg-slate-800/80 backdrop-blur shadow-lg border-0">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardHeader className="flex flex-row items-center justify-between pb-0">
             <CardTitle className="text-sm font-medium text-gray-600 dark:text-gray-300">内存</CardTitle>
             <MemoryStick className="w-4 h-4 text-purple-500" />
           </CardHeader>
-          <CardContent>
+          <CardContent className="pt-0 -mt-1">
             <div className="text-2xl font-bold text-purple-600">{formatPercent(systemData?.memory?.usedPercent)}</div>
-            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+            <p className="text-xs text-gray-500 dark:text-gray-400">
               {formatBytes(systemData?.memory?.used)} / {formatBytes(systemData?.memory?.total)}
             </p>
           </CardContent>
@@ -264,15 +334,15 @@ export default function Home() {
 
         {/* 硬盘 */}
         <Card className="bg-white/80 dark:bg-slate-800/80 backdrop-blur shadow-lg border-0">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardHeader className="flex flex-row items-center justify-between pb-0">
             <CardTitle className="text-sm font-medium text-gray-600 dark:text-gray-300">硬盘</CardTitle>
             <HardDrive className="w-4 h-4 text-pink-500" />
           </CardHeader>
-          <CardContent>
+          <CardContent className="pt-0 -mt-1">
             <div className="text-2xl font-bold text-pink-600">
               {formatPercent(systemData?.mainDisk?.usedPercent)}
             </div>
-            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+            <p className="text-xs text-gray-500 dark:text-gray-400">
               {formatBytes(systemData?.mainDisk?.used)} / {formatBytes(systemData?.mainDisk?.total)}
             </p>
           </CardContent>
@@ -281,31 +351,31 @@ export default function Home() {
         {/* 温度 - 读取不到时不显示 */}
         {systemData?.temperature?.cpu && (
           <Card className="bg-white/80 dark:bg-slate-800/80 backdrop-blur shadow-lg border-0">
-            <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardHeader className="flex flex-row items-center justify-between pb-0">
               <CardTitle className="text-sm font-medium text-gray-600 dark:text-gray-300">温度</CardTitle>
               <Thermometer className="w-4 h-4 text-orange-500" />
             </CardHeader>
-            <CardContent>
+            <CardContent className="pt-0 -mt-1">
               <div className="text-2xl font-bold text-orange-500">
                 {systemData.temperature.cpu}°C
               </div>
-              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">CPU 温度</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400">CPU 温度</p>
             </CardContent>
           </Card>
         )}
 
         {/* OpenClaw 状态 */}
         <Card className="bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-lg border-0">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardHeader className="flex flex-row items-center justify-between pb-0">
             <CardTitle className="text-sm font-medium text-white/80">OpenClaw</CardTitle>
             <Activity className="w-4 h-4 text-white" />
           </CardHeader>
-          <CardContent>
+          <CardContent className="pt-0 -mt-1">
             <div className="flex items-center gap-2">
               <div className={`w-2 h-2 rounded-full ${openclawData?.healthy ? 'bg-green-400' : 'bg-red-400'}`}></div>
               <span className="font-bold">{openclawData?.healthy ? '运行正常' : '异常'}</span>
             </div>
-            <p className="text-xs text-white/80 mt-1">
+            <p className="text-xs text-white/80">
               {openclawData?.sessionCount || 0} Sessions · {openclawData?.agentCount || 0} Agents
             </p>
           </CardContent>
@@ -313,16 +383,16 @@ export default function Home() {
 
         {/* Gateway 状态 */}
         <Card className="bg-gradient-to-br from-blue-500 to-cyan-600 text-white shadow-lg border-0">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardHeader className="flex flex-row items-center justify-between pb-0">
             <CardTitle className="text-sm font-medium text-white/80">Gateway</CardTitle>
             <Activity className="w-4 h-4 text-white" />
           </CardHeader>
-          <CardContent>
+          <CardContent className="pt-0 -mt-1">
             <div className="flex items-center gap-2">
               <div className={`w-2 h-2 rounded-full ${openclawData?.gatewayReachable ? 'bg-green-400' : 'bg-red-400'}`}></div>
               <span className="font-bold">{openclawData?.gatewayReachable ? '可达' : '不可达'}</span>
             </div>
-            <p className="text-xs text-white/80 mt-1">
+            <p className="text-xs text-white/80">
               {openclawData?.gatewayLatency || 'N/A'}
             </p>
           </CardContent>
@@ -330,15 +400,29 @@ export default function Home() {
 
         {/* Token 消耗 */}
         <Card className="bg-gradient-to-br from-green-500 to-teal-600 text-white shadow-lg border-0">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardHeader className="flex flex-row items-center justify-between pb-0">
             <CardTitle className="text-sm font-medium text-white/80">Token消耗</CardTitle>
             <Activity className="w-4 h-4 text-white" />
           </CardHeader>
-          <CardContent>
+          <CardContent className="pt-0 -mt-1">
             <div className="text-2xl font-bold">
               {openclawData?.totalTokens ? `${(openclawData.totalTokens / 1000).toFixed(1)}k` : '0'}
             </div>
-            <p className="text-xs text-white/80 mt-1">历史累计</p>
+            <p className="text-xs text-white/80">历史累计</p>
+          </CardContent>
+        </Card>
+
+        {/* 今日Token消耗 */}
+        <Card className="bg-gradient-to-br from-amber-500 to-orange-600 text-white shadow-lg border-0">
+          <CardHeader className="flex flex-row items-center justify-between pb-0">
+            <CardTitle className="text-sm font-medium text-white/80">今日Token消耗</CardTitle>
+            <Activity className="w-4 h-4 text-white" />
+          </CardHeader>
+          <CardContent className="pt-0 -mt-1">
+            <div className="text-2xl font-bold">
+              {openclawData?.todayTokens ? `${(openclawData.todayTokens / 1000).toFixed(1)}k` : '0'}
+            </div>
+            <p className="text-xs text-white/80">今日消耗</p>
           </CardContent>
         </Card>
       </div>
@@ -356,9 +440,9 @@ export default function Home() {
           </CardHeader>
           <CardContent>
             {/* 会话列表 */}
-            <div className="mb-4">
+            <div className="mb-4 relative">
               <select 
-                className="w-full p-3 border border-gray-200 dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-slate-700 focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-gray-900 dark:text-gray-100"
+                className="w-full p-3 pl-3 pr-8 border border-gray-200 dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-slate-700 focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-gray-900 dark:text-gray-100 appearance-none"
                 value={selectedSession || ''}
                 onChange={(e) => setSelectedSession(e.target.value)}
               >
@@ -369,6 +453,11 @@ export default function Home() {
                   </option>
                 ))}
               </select>
+              <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-gray-400">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </div>
             </div>
             
             {/* 消息列表 - 对话卡片专用滚动区域 */}
@@ -401,7 +490,9 @@ export default function Home() {
                 </div>
               ))}
               {(conversationMessages.length === 0) && (
-                <p className="text-center text-gray-400 dark:text-gray-500 py-4">选择会话查看消息</p>
+                <p className="text-center text-gray-400 dark:text-gray-500 py-4">
+                  {selectedSession ? '暂无消息' : '选择会话查看消息'}
+                </p>
               )}
             </div>
           </CardContent>

@@ -3,33 +3,61 @@ import Docker from 'dockerode';
 
 export const dynamic = 'force-dynamic';
 
-// Docker 连接池（复用连接）
+// Docker 实例缓存（按需创建，不用则销毁）
 let dockerInstance = null;
 let dockerInstanceTime = 0;
-const DOCKER_TTL = 60000; // 60秒复用
+const DOCKER_TTL = 30000; // 30秒复用
 
 function getDocker() {
   const now = Date.now();
+  // 如果超过 TTL 或者实例无效，重新创建
   if (!dockerInstance || (now - dockerInstanceTime) > DOCKER_TTL) {
+    try {
+      // 尝试销毁旧实例
+      if (dockerInstance) {
+        dockerInstance = null;
+      }
+    } catch (e) {
+      // 忽略销毁错误
+    }
     dockerInstance = new Docker();
     dockerInstanceTime = now;
   }
   return dockerInstance;
 }
 
+// 带重试的 Docker 操作（增加延迟和限制）
+async function dockerWithRetry(fn, maxRetries = 2) {
+  let lastError;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e;
+      // 首次失败时重置连接
+      dockerInstance = null;
+      dockerInstanceTime = 0;
+      if (i < maxRetries - 1) {
+        await new Promise(r => setTimeout(r, 300 * (i + 1))); // 递增延迟
+      }
+    }
+  }
+  throw lastError;
+}
+
 export async function GET() {
   try {
-    // 使用连接池
+    // 使用连接池（带重试）
     const docker = getDocker();
 
     // 获取所有容器（包括未运行的）
-    const containers = await docker.listContainers({ all: true });
+    const containers = await dockerWithRetry(() => docker.listContainers({ all: true }));
 
-    // 获取容器详细信息
+    // 获取容器详细信息（带超时和重试）
     const containerDetails = await Promise.all(
       containers.map(async (container) => {
         const info = docker.getContainer(container.Id);
-        const inspect = await info.inspect();
+        const inspect = await dockerWithRetry(() => info.inspect(), 2);
 
         // 计算运行时长
         const startedAt = new Date(inspect.State.StartedAt);

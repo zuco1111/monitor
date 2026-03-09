@@ -121,31 +121,33 @@ export async function GET() {
     const lines = listOutput.split('\n').filter(l => l.trim());
     
     for (const line of lines) {
-      if (line.includes('─') || line.includes('ID') || line.startsWith('Hint')) continue;
+      // 跳过表头和分隔线
+      if (line.includes('─') || line.includes('┌') || line.includes('ID') || line.startsWith('Hint')) continue;
       if (line.startsWith('ID ')) continue;
+      if (line.length < 130) continue;
       
-      if (line.length > 148) {
-        const id = line.substring(0, 37).trim();
-        const name = line.substring(37, 62).trim();
-        const schedule = line.substring(62, 95).trim();
-        const nextRun = line.substring(95, 106).trim();
-        const lastRun = line.substring(106, 117).trim();
-        const status = line.substring(117, 127).trim();
-        
-        if (id) {
-          // 计算精确的下次执行时间
-          const calculatedNextRun = calculateNextRun(schedule);
-          
-          tasks.push({
-            id,
-            name,
-            schedule: parseSchedule(schedule),
-            nextRun: calculatedNextRun || formatTime(nextRun),
-            lastRun: formatTime(lastRun),
-            status: status === 'ok' ? '已完成' : status
-          });
-        }
-      }
+      // 使用固定字符位置截取（兼容性好）
+      const id = line.substring(0, 37).trim();
+      const name = line.substring(37, 62).trim();
+      const schedule = line.substring(62, 95).trim();
+      const nextRun = line.substring(95, 106).trim();
+      const lastRun = line.substring(106, 117).trim();
+      const status = line.substring(117, 127).trim();
+      
+      // 过滤掉非任务的行
+      if (!id || id.length < 10 || id.includes('$') || id.includes('zuco')) continue;
+      
+      // 计算精确的下次执行时间
+      const calculatedNextRun = calculateNextRun(schedule);
+      
+      tasks.push({
+        id,
+        name,
+        schedule: parseSchedule(schedule),
+        nextRun: calculatedNextRun || formatTime(nextRun),
+        lastRun: formatTime(lastRun),
+        status: status === 'ok' ? '已完成' : status
+      });
     }
 
     const enabledTasks = tasks.filter(t => t.status === '已完成' || t.status === 'running').length;

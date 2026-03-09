@@ -51,14 +51,28 @@ async function getCPUTemperature() {
   return null;
 }
 
+// 带超时和错误处理的 Promise wrapper
+async function safeSystemInfo(fn, defaultValue, timeoutMs = 5000) {
+  try {
+    const result = await withTimeout(fn(), timeoutMs).catch(e => {
+      console.warn(`System info error: ${e.message}`);
+      return defaultValue;
+    });
+    return result || defaultValue;
+  } catch (e) {
+    console.warn(`System info error: ${e.message}`);
+    return defaultValue;
+  }
+}
+
 export async function GET() {
   try {
     // 并行获取所有系统信息（带超时保护）
     const [cpu, cpuInfo, mem, disks, cpuTemp] = await Promise.all([
-      withTimeout(si.currentLoad(), 5000).catch(() => null),
-      withTimeout(si.cpu(), 5000).catch(() => ({})),
-      withTimeout(si.mem(), 5000).catch(() => null),
-      withTimeout(si.fsSize(), 5000).catch(() => []),
+      safeSystemInfo(() => si.currentLoad(), null, 5000),
+      safeSystemInfo(() => si.cpu(), {}, 5000),
+      safeSystemInfo(() => si.mem(), null, 5000),
+      safeSystemInfo(() => si.fsSize(), [], 5000),
       getCPUTemperature()
     ]);
 
@@ -77,24 +91,27 @@ export async function GET() {
     // 计算总硬盘使用率（取第一个内置硬盘）
     const mainDisk = internalDisks[0] || {};
 
+    // 安全处理 cpu.cpus（可能是 null）
+    const cpuCores = (cpu?.cpus || []).map(c => c.load);
+
     return NextResponse.json({
       cpu: {
         speed: cpuInfo.cores?.[0]?.speed || 0,
         speedMin: cpuInfo.cores?.[0]?.speed || 0,
         speedMax: cpuInfo.brand,
-        load: cpu.currentLoad,
-        cores: cpu.cpus.map(c => c.load),
+        load: cpu?.currentLoad || 0,
+        cores: cpuCores,
         brand: cpuInfo.brand,
         coresCount: cpuInfo.cores,
         physicalCores: cpuInfo.physicalCores
       },
       memory: {
-        used: mem.used,
-        total: mem.total,
-        usedPercent: (mem.used / mem.total) * 100,
-        free: mem.free,
-        active: mem.active,
-        available: mem.available
+        used: mem?.used || 0,
+        total: mem?.total || 1,
+        usedPercent: mem?.total ? (mem.used / mem.total) * 100 : 0,
+        free: mem?.free || 0,
+        active: mem?.active || 0,
+        available: mem?.available || 0
       },
       disks: {
         internal: internalDisks.map(d => ({
@@ -124,7 +141,7 @@ export async function GET() {
       },
       temperature: {
         cpu: cpuTemp,
-        note: cpuTemp === null ? '无法获取温度' : null
+        note: cpuTemp === null ? 'M系列Mac不支持' : null
       }
     });
   } catch (error) {

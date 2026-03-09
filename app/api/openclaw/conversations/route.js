@@ -20,11 +20,24 @@ function getSessionFilePath(sessionKey, sessionId) {
   if (fs.existsSync(sessionsDir)) {
     const filePath = path.join(sessionsDir, `${sessionId}.jsonl`);
     if (fs.existsSync(filePath)) {
-      return filePath;
+      return { dir: sessionsDir, filePath, sessionId };
     }
   }
   
   return null;
+}
+
+// 检查 session 是否被 reset
+function checkSessionReset(sessionsDir, sessionId) {
+  if (!sessionsDir || !fs.existsSync(sessionsDir)) return false;
+  
+  try {
+    const files = fs.readdirSync(sessionsDir);
+    const resetFile = files.find(f => f.startsWith(sessionId) && f.includes('.reset.'));
+    return !!resetFile;
+  } catch (e) {
+    return false;
+  }
 }
 
 // 提取消息内容
@@ -52,6 +65,7 @@ export async function GET(request) {
   try {
     const { searchParams } = new URL(request.url);
     const sessionKey = searchParams.get('session');
+    const after = searchParams.get('after'); // 可选的时间戳，用于增量获取
 
     // 获取所有 session 列表
     const { stdout } = await execAsync('openclaw sessions --json', {
@@ -69,17 +83,22 @@ export async function GET(request) {
 
     // 如果指定了 sessionKey，读取该 session 的消息历史
     let messages = [];
+    let isReset = false;
     if (sessionKey && sessions.length > 0) {
       const session = sessions.find(s => s.key === sessionKey);
       if (session && session.sessionId) {
-        const sessionFile = getSessionFilePath(sessionKey, session.sessionId);
+        const sessionInfo = getSessionFilePath(sessionKey, session.sessionId);
         
-        if (sessionFile && fs.existsSync(sessionFile)) {
+        if (sessionInfo && fs.existsSync(sessionInfo.filePath)) {
+          // 检查是否被 reset
+          isReset = checkSessionReset(sessionInfo.dir, session.sessionId);
+          
           try {
-            const fileContent = fs.readFileSync(sessionFile, 'utf-8');
+            const fileContent = fs.readFileSync(sessionInfo.filePath, 'utf-8');
             const lines = fileContent.split('\n').filter(l => l.trim());
             
-            messages = lines
+            // 过滤消息
+            let filteredLines = lines
               .map(line => {
                 try {
                   return JSON.parse(line);
@@ -87,8 +106,18 @@ export async function GET(request) {
                   return null;
                 }
               })
-              .filter(item => item && item.type === 'message')
-              .slice(-30)  // 只取最近30条
+              .filter(item => item && item.type === 'message');
+            
+            // 如果指定了 after 参数，只返回增量消息
+            if (after) {
+              const afterTimestamp = parseInt(after);
+              filteredLines = filteredLines.filter(item => item.timestamp > afterTimestamp);
+            } else {
+              // 默认只取最近30条
+              filteredLines = filteredLines.slice(-30);
+            }
+            
+            messages = filteredLines
               .map(item => {
                 const msg = item.message;
                 return {
@@ -111,7 +140,8 @@ export async function GET(request) {
       sessions: sessions,
       totalSessions: sessions.length,
       currentSession: sessionKey,
-      messages: messages
+      messages: messages,
+      isReset: isReset
     });
   } catch (error) {
     console.error('OpenClaw conversations error:', error);
