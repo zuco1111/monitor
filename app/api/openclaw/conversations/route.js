@@ -67,8 +67,8 @@ export async function GET(request) {
     const sessionKey = searchParams.get('session');
     const after = searchParams.get('after'); // 可选的时间戳，用于增量获取
 
-    // 获取所有 session 列表
-    const { stdout } = await execAsync('openclaw sessions --json', {
+    // 获取所有 session 列表（包含所有 agent）
+    const { stdout } = await execAsync('openclaw sessions --all-agents --json', {
       timeout: 10000
     });
 
@@ -128,7 +128,7 @@ export async function GET(request) {
                   usage: msg?.usage
                 };
               })
-              .filter(msg => msg.content);  // 只保留有内容的消息
+              .filter(msg => msg.content && msg.role !== 'toolResult');  // 过滤掉工具结果
           } catch (e) {
             console.error('Failed to read session file:', e);
           }

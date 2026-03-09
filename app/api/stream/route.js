@@ -17,6 +17,7 @@ export const dynamic = 'force-dynamic';
 let cachedData = null;
 let cacheTime = 0;
 const CACHE_TTL = 5000; // 后端缓存 5 秒
+let isFetching = false; // 防止并发抓取
 
 // Token 存储路径
 const TOKEN_STORAGE_FILE = path.join(os.homedir(), '.openclaw', 'token-usage.json');
@@ -433,6 +434,13 @@ async function fetchAllData() {
     return cachedData;
   }
   
+  // 防止并发抓取
+  if (isFetching) {
+    return cachedData || { error: 'Fetching in progress', cached: true };
+  }
+  
+  isFetching = true;
+  
   try {
     const [openclaw, system, docker, cron] = await Promise.all([
       fetchOpenClawStatus(),
@@ -449,10 +457,12 @@ async function fetchAllData() {
       timestamp: now
     };
     cacheTime = now;
+    isFetching = false;
     
     return cachedData;
   } catch (e) {
     console.error('fetchAllData error:', e);
+    isFetching = false;
     return cachedData || { error: e.message };
   }
 }
