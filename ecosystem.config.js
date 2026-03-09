@@ -21,11 +21,13 @@ module.exports = {
       retries: 3,
       restart_delay: 1000
     },
-    // 日志配置
-    out_file: '/tmp/monitor-out.log',
-    error_file: '/tmp/monitor-error.log',
+    // 日志配置 - 自动轮转
+    out_file: '/Volumes/SpaceShip/Projects/Monitor/logs/out.log',
+    error_file: '/Volumes/SpaceShip/Projects/Monitor/logs/error.log',
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     merge_logs: true,
+    // PM2 Logrotate (自动安装)
+    // 运行: pm2 install pm2-logrotate
     // 进程保护
     max_restarts: 10,
     min_uptime: '10s',

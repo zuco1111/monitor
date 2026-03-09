@@ -146,10 +146,13 @@ async function calculateTodayTokens() {
   const today = getTodayDateString();
   const currentTotal = calculateTotalTokensAllSessions();
   
+  // 首次运行或跨天：更新 yesterdayTotal
   if (storage.lastUpdateDate !== today) {
     if (storage.lastUpdateDate === null) {
-      storage.yesterdayTotal = 0;
+      // 首次运行：把当前总量设为昨日基准，今日消耗为 0
+      storage.yesterdayTotal = currentTotal;
     }
+    // 跨天时保持 yesterdayTotal 不变（用之前累计值）
     storage.lastUpdateDate = today;
     await saveDailyTokenStorage(storage);
   }
