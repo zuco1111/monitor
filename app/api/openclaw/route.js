@@ -73,11 +73,8 @@ function getSessionFileCreatedTime(filePath) {
   }
 }
 
-/* 
 // ============================================================================
-// 注释掉的旧版本：方案3 - 只计算今日消息的token增量
-// 存在问题：重置对话时会减少今日token消耗，不符合需求
-// 需求：今日token消耗不受重置对话、删除对话、删除session影响
+// 方案3 - 只计算今日消息的token增量（已恢复）
 // ============================================================================
 async function calculateTodayTokens() {
   const homeDir = os.homedir();
@@ -211,19 +208,12 @@ function getTodayTokenIncrement(sessionFilePath, todayStart) {
   }
 }
 // ============================================================================
-*/
 
 
+/*
 // ============================================================================
-// 方案4 - 分离历史基准 (historyBaseline)
-// 设计原则：
-// 1. 每天0点重置，重新计算今日token消耗
-// 2. 每个session记录 historyBaseline（历史基准token）
-// 3. 今日token消耗 = 当前token - historyBaseline
-// 4. 重置对话不影响：重置后currentTokens减少，但historyBaseline不变，差值不变
-// 5. 删除session不影响：删除时保留其 historyBaseline，后续仍计入
+// 方案4 - 分离历史基准 (historyBaseline) - 已禁用
 // ============================================================================
-
 async function calculateTodayTokens() {
   const homeDir = os.homedir();
   const sessionsDir = path.join(homeDir, '.openclaw', 'agents', 'main', 'sessions');
@@ -352,6 +342,8 @@ function getYesterdayDateString() {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 }
 // ============================================================================
+*/
+
 
 // 简单内存缓存
 let cachedResult = null;
