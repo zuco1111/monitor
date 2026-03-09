@@ -25,14 +25,9 @@ function getTodayDateString() {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 }
 
-// 获取今天的开始时间戳 (毫秒)
-function getTodayStartTimestamp() {
-  const now = new Date();
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
-}
-
-// 每日token存储结构: { daily: { "2026-03-08": { total: 1000, sessions: {...} } }, lastResetDate: "2026-03-08" }
-// 持久化设计：删除 session 不影响历史记录的今日 token，只在跨天时重置
+// 每日token存储结构: { yesterdayTotal: 1000, lastUpdateDate: "2026-03-08" }
+// 今日 token = 当前历史总消耗 - yesterdayTotal
+// 跨天时自动更新 yesterdayTotal
 
 // 异步保存每日token记录
 async function saveDailyTokenStorage(storage) {
@@ -60,152 +55,47 @@ function loadDailyTokenStorage() {
   } catch (e) {
     console.error('Error loading daily token storage:', e);
   }
-  return { daily: {}, lastResetDate: null };
+  return { yesterdayTotal: 0, lastUpdateDate: null };
 }
 
-// 获取 session 文件的创建时间
-function getSessionFileCreatedTime(filePath) {
-  try {
-    const stats = fs.statSync(filePath);
-    return stats.birthtime.getTime();
-  } catch (e) {
-    return Date.now();
-  }
+// 获取昨天日期字符串 (YYYY-MM-DD)
+function getYesterdayDateString() {
+  const now = new Date();
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  return `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
 }
 
 // ============================================================================
-// 方案3 - 只计算今日消息的token增量（已恢复）
+// 新方案：今日token = 当前历史总消耗 - 昨日历史总消耗
 // ============================================================================
 async function calculateTodayTokens() {
-  const homeDir = os.homedir();
-  const sessionsDir = path.join(homeDir, '.openclaw', 'agents', 'main', 'sessions');
-  
   const storage = loadDailyTokenStorage();
   const today = getTodayDateString();
-  const todayStart = getTodayStartTimestamp();
+  const yesterday = getYesterdayDateString();
   
-  // 检查是否需要重置（跨天）
-  if (storage.lastResetDate !== today) {
-    storage.daily = {};
-    storage.daily[today] = { total: 0, sessions: {} };
-    storage.lastResetDate = today;
+  // 获取当前历史总消耗
+  const currentTotal = getCachedTokens();
+  
+  // 检查是否需要跨天更新
+  if (storage.lastUpdateDate !== today) {
+    if (storage.lastUpdateDate === null) {
+      // 首次运行：yesterdayTotal 设为 0
+      storage.yesterdayTotal = 0;
+    }
+    // 跨多天的情况：保持原来的 yesterdayTotal 不变（用之前的值作为基准）
+    
+    storage.lastUpdateDate = today;
     await saveDailyTokenStorage(storage);
+    
+    console.log(`[Token] Day change detected, yesterdayTotal: ${storage.yesterdayTotal}`);
     return { todayTokens: 0 };
   }
   
-  if (!storage.daily[today]) {
-    storage.daily[today] = { total: 0, sessions: {} };
-  }
+  // 今日 token = 当前历史总消耗 - 昨日历史总消耗
+  const todayTokens = Math.max(0, currentTotal - storage.yesterdayTotal);
   
-  const todayData = storage.daily[today];
-  
-  if (!fs.existsSync(sessionsDir)) {
-    return { todayTokens: todayData.total };
-  }
-  
-  let todayTotal = 0;
-  const currentSessions = {};
-  const deletedSessions = { ...todayData.sessions };
-  
-  try {
-    const files = fs.readdirSync(sessionsDir);
-    
-    for (const file of files) {
-      if (!file.endsWith('.jsonl')) continue;
-      
-      const sessionId = file.replace('.jsonl', '');
-      const filePath = path.join(sessionsDir, file);
-      const fileCreatedTime = getSessionFileCreatedTime(filePath);
-      const existingSessionData = todayData.sessions?.[sessionId];
-      
-      const isRebuilt = existingSessionData && existingSessionData.fileCreated !== fileCreatedTime;
-      
-      if (existingSessionData && !isRebuilt) {
-        delete deletedSessions[sessionId];
-      } else if (isRebuilt) {
-        deletedSessions[sessionId] = existingSessionData;
-      }
-      
-      const tokenInfo = getTodayTokenIncrement(filePath, todayStart);
-      
-      if (tokenInfo.increment > 0) {
-        todayTotal += tokenInfo.increment;
-      }
-      
-      currentSessions[sessionId] = {
-        lastTokens: tokenInfo.currentTokens,
-        firstTodayTokens: tokenInfo.firstTodayTokens,
-        fileCreated: fileCreatedTime,
-        lastUpdate: Date.now()
-      };
-    }
-    
-    for (const [sessionId, sessionData] of Object.entries(deletedSessions)) {
-      const firstTodayTokens = sessionData.firstTodayTokens || 0;
-      const lastTokens = sessionData.lastTokens || 0;
-      const todayIncrement = Math.max(0, lastTokens - firstTodayTokens);
-      if (todayIncrement > 0) {
-        todayTotal += todayIncrement;
-        console.log(`[Token] Session ${sessionId} deleted, preserved ${todayIncrement} tokens`);
-      }
-    }
-    
-    storage.daily[today].sessions = currentSessions;
-    if (storage.daily[today].total !== todayTotal) {
-      storage.daily[today].total = todayTotal;
-      await saveDailyTokenStorage(storage);
-    }
-    
-  } catch (e) {
-    console.error('Error calculating today tokens:', e);
-  }
-  
-  return { todayTokens: todayTotal };
-}
-
-function getTodayTokenIncrement(sessionFilePath, todayStart) {
-  try {
-    const stats = fs.statSync(sessionFilePath);
-    if (stats.size === 0) {
-      return { increment: 0, currentTokens: 0, firstTodayTokens: null };
-    }
-    
-    const content = fs.readFileSync(sessionFilePath, 'utf-8');
-    const lines = content.split('\n').filter(l => l.trim());
-    
-    let increment = 0;
-    let lastTokens = 0;
-    let currentTokens = 0;
-    let firstTodayTokens = null;
-    
-    for (const line of lines) {
-      try {
-        const obj = JSON.parse(line);
-        const msgTime = obj.message?.timestamp || 0;
-        
-        if (obj.type === 'message' && obj.message?.usage?.totalTokens) {
-          const msgTokens = obj.message.usage.totalTokens;
-          currentTokens = msgTokens;
-          
-          if (msgTime >= todayStart) {
-            if (firstTodayTokens === null) {
-              firstTodayTokens = msgTokens;
-              lastTokens = msgTokens;
-            } else {
-              if (msgTokens > lastTokens) {
-                increment += (msgTokens - lastTokens);
-              }
-              lastTokens = msgTokens;
-            }
-          }
-        }
-      } catch (e) {}
-    }
-    
-    return { increment, currentTokens, firstTodayTokens };
-  } catch (e) {
-    return { increment: 0, currentTokens: 0, firstTodayTokens: null };
-  }
+  return { todayTokens };
 }
 // ============================================================================
 
