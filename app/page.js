@@ -122,20 +122,17 @@ export default function Home() {
     }
   }, [theme]);
 
-  // 获取数据 - 静默刷新，不显示 loading
+  // SSE 连接 ref
+  const eventSourceRef = useRef(null);
+
+  // 手动刷新（保留按钮功能）
   const fetchData = async () => {
     try {
-      const [system, docker, openclaw, tasks] = await Promise.all([
-        fetch('/api/system').then(r => r.json()).catch(() => null),
-        fetch('/api/docker').then(r => r.json()).catch(() => null),
-        fetch('/api/openclaw').then(r => r.json()).catch(() => null),
-        fetch('/api/openclaw/tasks').then(r => r.json()).catch(() => null)
-      ]);
-
-      setSystemData(system);
-      setDockerData(docker);
-      setOpenclawData(openclaw);
-      setTasksData(tasks);
+      const data = await fetch('/api/stream').then(r => r.json());
+      if (data.openclaw) setOpenclawData(data.openclaw);
+      if (data.system) setSystemData(data.system);
+      if (data.docker) setDockerData(data.docker);
+      if (data.cron) setTasksData(data.cron);
       setLastUpdate(new Date());
     } catch (error) {
       console.error('Failed to fetch data:', error);
@@ -237,12 +234,40 @@ export default function Home() {
     }).catch(() => {})
   );
 
-  // 首次加载
+  // 首次加载 - 使用 SSE 替代轮询
   useEffect(() => {
+    // 立即获取一次数据
     fetchData();
     fetchSessionsList();
-    const interval = setInterval(fetchData, 5000);
-    return () => clearInterval(interval);
+
+    // 建立 SSE 连接
+    const eventSource = new EventSource('/api/stream');
+    eventSourceRef.current = eventSource;
+
+    eventSource.addEventListener('update', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.openclaw) setOpenclawData(data.openclaw);
+        if (data.system) setSystemData(data.system);
+        if (data.docker) setDockerData(data.docker);
+        if (data.cron) setTasksData(data.cron);
+        setLastUpdate(new Date());
+      } catch (e) {
+        console.error('SSE parse error:', e);
+      }
+    });
+
+    eventSource.addEventListener('error', (event) => {
+      console.error('SSE error:', event);
+    });
+
+    eventSource.addEventListener('ping', () => {
+      // 心跳，保持连接活跃
+    });
+
+    return () => {
+      eventSource.close();
+    };
   }, []);
 
   // 当选中会话变化时，获取该会话的消息
