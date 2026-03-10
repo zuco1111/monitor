@@ -3,7 +3,7 @@ module.exports = {
     name: 'monitor',
     script: 'npm',
     args: 'start',
-    cwd: '/Volumes/SpaceShip/Monitor',
+    cwd: '/Volumes/SpaceShip/Projects/Monitor',
     instances: 1,
     autorestart: true,
     watch: false,

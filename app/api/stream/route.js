@@ -1,167 +1,21 @@
 import { NextResponse } from 'next/server';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import fs from 'fs';
-import fsPromises from 'fs/promises';
-import { randomUUID } from 'crypto';
-import path from 'path';
-import os from 'os';
 import * as si from 'systeminformation';
-import { CronExpressionParser } from 'cron-parser';
 
 const execAsync = promisify(exec);
 
 export const dynamic = 'force-dynamic';
 
-// ============== 缓存系统 ==============
-let cachedData = null;
-let cacheTime = 0;
-const CACHE_TTL = 5000; // 后端缓存 5 秒
-let isFetching = false; // 防止并发抓取
+// 导入共享的 Token 计算模块
+import { 
+  calculateTotalTokensAllSessions, 
+  calculateTodayTokens,
+  getTodayDateString,
+  getYesterdayDateString
+} from '../token-utils';
 
-// Token 存储路径
-const TOKEN_STORAGE_FILE = path.join(os.homedir(), '.openclaw', 'token-usage.json');
-const DAILY_TOKEN_FILE = path.join(os.homedir(), '.openclaw', 'daily-token.json');
-
-function getTodayDateString() {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-}
-
-function loadDailyTokenStorage() {
-  try {
-    if (fs.existsSync(DAILY_TOKEN_FILE)) {
-      const data = fs.readFileSync(DAILY_TOKEN_FILE, 'utf-8');
-      return JSON.parse(data);
-    }
-  } catch (e) {}
-  return { yesterdayTotal: 0, lastUpdateDate: null };
-}
-
-async function saveDailyTokenStorage(storage) {
-  const tempFile = DAILY_TOKEN_FILE + '.' + randomUUID() + '.tmp';
-  try {
-    const dir = path.dirname(DAILY_TOKEN_FILE);
-    await fsPromises.mkdir(dir, { recursive: true });
-    await fsPromises.writeFile(tempFile, JSON.stringify(storage, null, 2), 'utf-8');
-    await fsPromises.rename(tempFile, DAILY_TOKEN_FILE);
-  } catch (e) {
-    try { await fsPromises.unlink(tempFile); } catch {}
-  }
-}
-
-function getFinalTokensFromSession(sessionFilePath) {
-  try {
-    const stats = fs.statSync(sessionFilePath);
-    if (stats.size === 0) return 0;
-    const readSize = Math.min(stats.size, 100 * 1024);
-    const buffer = Buffer.alloc(readSize);
-    const fd = fs.openSync(sessionFilePath, 'r');
-    fs.readSync(fd, buffer, 0, readSize, stats.size - readSize);
-    fs.closeSync(fd);
-    const content = buffer.toString('utf-8');
-    const lines = content.split('\n').filter(l => l.trim());
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const obj = JSON.parse(lines[i]);
-        if (obj.type === 'message' && obj.message?.usage?.totalTokens) {
-          return obj.message.usage.totalTokens;
-        }
-      } catch {}
-    }
-    return 0;
-  } catch { return 0; }
-}
-
-function loadTokenStorage() {
-  try {
-    if (fs.existsSync(TOKEN_STORAGE_FILE)) {
-      const data = fs.readFileSync(TOKEN_STORAGE_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (parsed && typeof parsed.total === 'number' && parsed.total >= 0) {
-        return parsed;
-      }
-    }
-  } catch {}
-  return { sessions: {}, total: 0, lastUpdated: null };
-}
-
-function isSessionReset(sessionsDir, sessionId) {
-  try {
-    const files = fs.readdirSync(sessionsDir);
-    return files.some(f => f.startsWith(sessionId) && f.includes('.reset.'));
-  } catch { return false; }
-}
-
-function calculateTotalTokensAllSessions() {
-  const homeDir = os.homedir();
-  const sessionsDir = path.join(homeDir, '.openclaw', 'agents', 'main', 'sessions');
-  const storage = loadTokenStorage();
-  let totalTokens = storage.total || 0;
-  const knownSessions = storage.sessions || {};
-  
-  if (!fs.existsSync(sessionsDir)) return totalTokens;
-  
-  try {
-    const files = fs.readdirSync(sessionsDir);
-    const currentSessions = {};
-    let hasChanges = false;
-    
-    for (const file of files) {
-      if (!file.endsWith('.jsonl')) continue;
-      const sessionId = file.replace('.jsonl', '');
-      const filePath = path.join(sessionsDir, file);
-      const currentTokens = getFinalTokensFromSession(filePath);
-      
-      if (currentTokens > 0) {
-        currentSessions[sessionId] = currentTokens;
-        const wasReset = isSessionReset(sessionsDir, sessionId);
-        
-        if (!knownSessions[sessionId] || wasReset) {
-          totalTokens += currentTokens;
-          hasChanges = true;
-        } else if (knownSessions[sessionId] !== currentTokens) {
-          const diff = currentTokens - knownSessions[sessionId];
-          if (diff > 0) {
-            totalTokens += diff;
-            hasChanges = true;
-          }
-        }
-      }
-    }
-    
-    if (hasChanges) {
-      storage.sessions = currentSessions;
-      storage.total = totalTokens;
-      storage.lastUpdated = new Date().toISOString();
-      fs.writeFileSync(TOKEN_STORAGE_FILE, JSON.stringify(storage, null, 2), 'utf-8');
-    }
-  } catch {}
-  
-  return totalTokens;
-}
-
-async function calculateTodayTokens() {
-  const storage = loadDailyTokenStorage();
-  const today = getTodayDateString();
-  const currentTotal = calculateTotalTokensAllSessions();
-  
-  // 首次运行或跨天：更新 yesterdayTotal
-  if (storage.lastUpdateDate !== today) {
-    if (storage.lastUpdateDate === null) {
-      // 首次运行：把当前总量设为昨日基准，今日消耗为 0
-      storage.yesterdayTotal = currentTotal;
-    }
-    // 跨天时保持 yesterdayTotal 不变（用之前累计值）
-    storage.lastUpdateDate = today;
-    await saveDailyTokenStorage(storage);
-  }
-  
-  const todayTokens = Math.max(0, currentTotal - storage.yesterdayTotal);
-  return { todayTokens };
-}
-
-// ============== OpenClaw 状态抓取 ==============
+// ============== 解析函数 ==============
 function parseOverview(lines) {
   const overview = {};
   let inOverview = false;
@@ -219,6 +73,7 @@ function parseGatewaySection(lines) {
   return gateways;
 }
 
+// ============== OpenClaw 状态抓取 ==============
 async function fetchOpenClawStatus() {
   const [statusResult, sessionsResult, tokenResult, todayTokenResult] = await Promise.all([
     execAsync('openclaw status 2>&1', { timeout: 10000 }),
@@ -429,6 +284,12 @@ async function fetchCronTasks() {
 }
 
 // ============== 统一数据抓取 ==============
+// ============== 缓存系统 ==============
+let cachedData = null;
+let cacheTime = 0;
+const CACHE_TTL = 5000; // 后端缓存 5 秒
+let isFetching = false; // 防止并发抓取
+
 async function fetchAllData() {
   const now = Date.now();
   
