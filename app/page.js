@@ -125,19 +125,46 @@ export default function Home() {
   // SSE 连接 ref
   const eventSourceRef = useRef(null);
 
-  // 手动刷新（保留按钮功能）
-  const fetchData = async () => {
-    try {
-      const data = await fetch('/api/stream').then(r => r.json());
-      if (data.openclaw) setOpenclawData(data.openclaw);
-      if (data.system) setSystemData(data.system);
-      if (data.docker) setDockerData(data.docker);
-      if (data.cron) setTasksData(data.cron);
-      setLastUpdate(new Date());
-    } catch (error) {
-      console.error('Failed to fetch data:', error);
-    }
-  };
+  // 手动刷新（保留按钮功能）- 使用 EventSource 获取 SSE 数据
+  const fetchData = useCallback(() => {
+    return new Promise((resolve) => {
+      try {
+        const eventSource = new EventSource('/api/stream');
+        
+        eventSource.addEventListener('update', (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.openclaw) setOpenclawData(data.openclaw);
+            if (data.system) setSystemData(data.system);
+            if (data.docker) setDockerData(data.docker);
+            if (data.cron) setTasksData(data.cron);
+            setLastUpdate(new Date());
+            eventSource.close();
+            resolve(data);
+          } catch (e) {
+            console.error('SSE parse error:', e);
+            eventSource.close();
+            resolve(null);
+          }
+        });
+
+        eventSource.addEventListener('error', (event) => {
+          console.error('SSE error:', event);
+          eventSource.close();
+          resolve(null);
+        });
+
+        // 超时保护：5秒后自动关闭
+        setTimeout(() => {
+          eventSource.close();
+          resolve(null);
+        }, 5000);
+      } catch (error) {
+        console.error('Failed to fetch data:', error);
+        resolve(null);
+      }
+    });
+  }, []);
 
   // 首次加载时获取会话列表（带缓存限制）
   const fetchSessionsList = async () => {
