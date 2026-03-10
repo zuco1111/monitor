@@ -125,46 +125,60 @@ export default function Home() {
   // SSE 连接 ref
   const eventSourceRef = useRef(null);
 
-  // 手动刷新（保留按钮功能）- 使用 EventSource 获取 SSE 数据
+  // 手动刷新 - 使用 EventSource 获取一次数据后关闭
   const fetchData = useCallback(() => {
     return new Promise((resolve) => {
       try {
         const eventSource = new EventSource('/api/stream');
+        let resolved = false;
+        
+        const cleanup = () => {
+          if (!resolved) {
+            resolved = true;
+            eventSource.close();
+          }
+        };
         
         eventSource.addEventListener('update', (event) => {
           try {
             const data = JSON.parse(event.data);
-            if (data.openclaw) setOpenclawData(data.openclaw);
-            if (data.system) setSystemData(data.system);
-            if (data.docker) setDockerData(data.docker);
-            if (data.cron) setTasksData(data.cron);
-            setLastUpdate(new Date());
-            eventSource.close();
+            updateAllData(data);
+            cleanup();
             resolve(data);
           } catch (e) {
             console.error('SSE parse error:', e);
-            eventSource.close();
+            cleanup();
             resolve(null);
           }
         });
 
-        eventSource.addEventListener('error', (event) => {
-          console.error('SSE error:', event);
-          eventSource.close();
+        eventSource.addEventListener('error', () => {
+          console.error('SSE error');
+          cleanup();
           resolve(null);
         });
 
-        // 超时保护：5秒后自动关闭
+        // 超时保护：10秒后自动关闭
         setTimeout(() => {
-          eventSource.close();
+          cleanup();
           resolve(null);
-        }, 5000);
+        }, 10000);
       } catch (error) {
         console.error('Failed to fetch data:', error);
         resolve(null);
       }
     });
   }, []);
+
+  // 统一的数据更新函数
+  const updateAllData = (data) => {
+    if (!data) return;
+    if (data.openclaw) setOpenclawData(data.openclaw);
+    if (data.system) setSystemData(data.system);
+    if (data.docker) setDockerData(data.docker);
+    if (data.cron) setTasksData(data.cron);
+    setLastUpdate(new Date());
+  };
 
   // 首次加载时获取会话列表（带缓存限制）
   const fetchSessionsList = async () => {
@@ -261,39 +275,71 @@ export default function Home() {
     }).catch(() => {})
   );
 
+  // SSE 重连配置
+  const SSE_RECONNECT_DELAY = 3000;
+  const SSE_MAX_RETRIES = 5;
+  
   // 首次加载 - 使用 SSE 替代轮询
   useEffect(() => {
-    // 立即获取一次数据
-    fetchData();
+    let retryCount = 0;
+    let reconnectTimeout = null;
+    
+    // 不需要手动 fetchData，SSE 会自动获取数据
     fetchSessionsList();
 
     // 建立 SSE 连接
-    const eventSource = new EventSource('/api/stream');
-    eventSourceRef.current = eventSource;
+    const connectSSE = () => {
+      const eventSource = new EventSource('/api/stream');
+      eventSourceRef.current = eventSource;
 
-    eventSource.addEventListener('update', (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.openclaw) setOpenclawData(data.openclaw);
-        if (data.system) setSystemData(data.system);
-        if (data.docker) setDockerData(data.docker);
-        if (data.cron) setTasksData(data.cron);
-        setLastUpdate(new Date());
-      } catch (e) {
-        console.error('SSE parse error:', e);
-      }
-    });
+      eventSource.addEventListener('update', (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          updateAllData(data);
+        } catch (e) {
+          console.error('SSE parse error:', e);
+        }
+      });
 
-    eventSource.addEventListener('error', (event) => {
-      console.error('SSE error:', event);
-    });
+      eventSource.addEventListener('error', (event) => {
+        // EventSource readyState: 0=CONNECTING, 1=OPEN, 2=CLOSED
+        // 只有 CLOSED 状态才是真正的连接错误
+        if (eventSource.readyState === 2) {
+          console.error('SSE connection closed');
+          
+          // 尝试重连
+          if (retryCount < SSE_MAX_RETRIES) {
+            retryCount++;
+            console.log(`SSE reconnecting... (${retryCount}/${SSE_MAX_RETRIES})`);
+            reconnectTimeout = setTimeout(() => {
+              eventSource.close();
+              connectSSE();
+            }, SSE_RECONNECT_DELAY);
+          } else {
+            console.error('SSE max retries reached, giving up');
+          }
+        }
+        // readyState 0 (CONNECTING) 是正常的，不用处理
+      });
 
-    eventSource.addEventListener('ping', () => {
-      // 心跳，保持连接活跃
-    });
+      eventSource.addEventListener('open', () => {
+        // 连接成功，重置重试计数
+        retryCount = 0;
+        console.log('SSE connected');
+      });
+
+      eventSource.addEventListener('ping', () => {
+        // 心跳，保持连接活跃
+      });
+    };
+
+    connectSSE();
 
     return () => {
-      eventSource.close();
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+      }
     };
   }, []);
 
@@ -346,7 +392,7 @@ export default function Home() {
           </button>
           {/* 刷新 */}
           <button 
-            onClick={fetchData}
+            onClick={() => fetchData()}
             className="p-2 rounded-lg bg-gradient-to-r from-indigo-500 to-purple-500 text-white hover:from-indigo-600 hover:to-purple-600 transition-all shadow-md"
           >
             <RefreshCw className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} />
