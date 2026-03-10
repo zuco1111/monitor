@@ -373,7 +373,7 @@ export default function Home() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-3xl font-bold bg-gradient-to-r from-indigo-600 to-purple-600 bg-clip-text text-transparent dark:text-white">
-            系统监控面板
+            🦞小龙虾状态监测
           </h1>
           <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
             最后更新: {lastUpdate ? lastUpdate.toLocaleTimeString() : '加载中...'}

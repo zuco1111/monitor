@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 
 export const metadata = {
   title: "OpenClaw Monitor",
-  description: "OpenClaw 系统监控面板",
+  description: "OpenClaw 🦞小龙虾状态监测",
 };
 
 export default function RootLayout({ children }) {
