@@ -288,7 +288,10 @@ async function fetchCronTasks() {
 let cachedData = null;
 let cacheTime = 0;
 const CACHE_TTL = 5000; // 后端缓存 5 秒
-let isFetching = false; // 防止并发抓取
+
+// P1 修复：使用 Promise 锁防止并发抓取
+let fetchPromise = null;
+let fetchResolve = null;
 
 async function fetchAllData() {
   const now = Date.now();
@@ -298,12 +301,18 @@ async function fetchAllData() {
     return cachedData;
   }
   
-  // 防止并发抓取
-  if (isFetching) {
+  // P1 修复：防止并发抓取 - 使用 Promise 锁
+  if (fetchPromise) {
+    // 已有请求在进行中，等待它完成
+    await fetchPromise;
     return cachedData || { error: 'Fetching in progress', cached: true };
   }
   
-  isFetching = true;
+  // 创建新的锁
+  let releaseLock = null;
+  fetchPromise = new Promise((resolve) => {
+    releaseLock = resolve;
+  });
   
   try {
     const [openclaw, system, docker, cron] = await Promise.all([
@@ -321,13 +330,15 @@ async function fetchAllData() {
       timestamp: now
     };
     cacheTime = now;
-    isFetching = false;
     
     return cachedData;
   } catch (e) {
     console.error('fetchAllData error:', e);
-    isFetching = false;
     return cachedData || { error: e.message };
+  } finally {
+    // 释放锁
+    fetchPromise = null;
+    if (releaseLock) releaseLock();
   }
 }
 
@@ -337,17 +348,34 @@ export async function GET(request) {
   
   const stream = new ReadableStream({
     async start(controller) {
+      // P0 修复：添加连接状态追踪
+      let isClientConnected = true;
+      
       const send = (event, data) => {
-        controller.enqueue(encoder.encode(`event: ${event}\n`));
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        // P0 修复：检查客户端是否仍然连接
+        if (!isClientConnected) {
+          return;
+        }
+        try {
+          controller.enqueue(encoder.encode(`event: ${event}\n`));
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        } catch (e) {
+          // 客户端已断开，标记并停止发送
+          isClientConnected = false;
+        }
       };
 
       // 立即发送一次数据
       const data = await fetchAllData();
       send('update', data);
 
-      // 每 5 秒推送一次（后端缓存TTL）
+      // P0 修复：每 5 秒推送一次，添加连接状态检测
       const interval = setInterval(async () => {
+        if (!isClientConnected) {
+          clearInterval(interval);
+          clearInterval(heartbeat);
+          return;
+        }
         try {
           const freshData = await fetchAllData();
           send('update', freshData);
@@ -356,17 +384,25 @@ export async function GET(request) {
         }
       }, 5000);
 
-      // 心跳保持连接
+      // P0 修复：心跳保持连接
       const heartbeat = setInterval(() => {
         send('ping', { time: Date.now() });
       }, 30000);
 
-      // 清理
-      request.signal.addEventListener('abort', () => {
+      // P0 修复：清理函数
+      const cleanup = () => {
+        isClientConnected = false;
         clearInterval(interval);
         clearInterval(heartbeat);
-        controller.close();
-      });
+        try {
+          controller.close();
+        } catch (e) {
+          // 可能已经关闭
+        }
+      };
+
+      // 监听连接断开
+      request.signal.addEventListener('abort', cleanup);
     }
   });
 
