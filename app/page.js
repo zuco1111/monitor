@@ -9,6 +9,20 @@ import {
   Sun, Moon, Monitor
 } from 'lucide-react';
 
+// 带重试的 fetch 封装
+async function fetchWithRetry(url, retries = 3, delay = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.json();
+    } catch (e) {
+      if (i === retries - 1) throw e;
+      await new Promise(r => setTimeout(r, delay * (i + 1)));
+    }
+  }
+}
+
 // 智能滚动 Hook - 优化版，减少重渲染
 function useSmartScroll(fetchData, idleTimeout = 5000) {
   const [lastActivity, setLastActivity] = useState(Date.now());
@@ -183,7 +197,18 @@ export default function Home() {
   // 首次加载时获取会话列表（带缓存限制）
   const fetchSessionsList = async () => {
     try {
-      const data = await fetch('/api/openclaw/conversations').then(r => r.json());
+      const response = await fetch('/api/openclaw/conversations');
+      // 检查响应是否有效
+      if (!response.ok || response.status === 204) {
+        setSessionsList([]);
+        return;
+      }
+      const text = await response.text();
+      if (!text || text.trim() === '') {
+        setSessionsList([]);
+        return;
+      }
+      const data = JSON.parse(text);
       if (data.sessions && data.sessions.length > 0) {
         // 限制会话列表数量，防止内存泄漏
         const limitedSessions = data.sessions.slice(0, MAX_SESSION_LIST);
@@ -194,6 +219,7 @@ export default function Home() {
       }
     } catch (e) {
       console.error('Failed to fetch sessions:', e);
+      setSessionsList([]);
     }
   };
 
@@ -213,7 +239,7 @@ export default function Home() {
         ? `/api/openclaw/conversations?session=${encodeURIComponent(sessionKey)}`
         : `/api/openclaw/conversations?session=${encodeURIComponent(sessionKey)}&after=${lastMessageTimestampRef.current}`;
       
-      const data = await fetch(url).then(r => r.json());
+      const data = await fetchWithRetry(url);
       
       // 检查是否被 reset，如果是则清空消息重新获取
       if (data.isReset && !lastResetStatusRef.current && !isFullFetch) {
@@ -223,7 +249,7 @@ export default function Home() {
         lastMessageTimestampRef.current = 0;
         
         const resetUrl = `/api/openclaw/conversations?session=${encodeURIComponent(sessionKey)}`;
-        const resetData = await fetch(resetUrl).then(r => r.json());
+        const resetData = await fetchWithRetry(resetUrl);
         const resetMessages = (resetData.messages || []).slice(0, MAX_CACHED_MESSAGES);
         setConversationMessages(resetMessages);
         if (resetMessages.length > 0) {
@@ -403,44 +429,44 @@ export default function Home() {
       {/* 系统状态一行 - 自适应卡片 */}
       <div className={`grid gap-3 mb-6 ${systemData?.temperature?.cpu ? 'grid-cols-2 md:grid-cols-4 lg:grid-cols-8' : 'grid-cols-2 md:grid-cols-3 lg:grid-cols-7'}`}>
         {/* CPU */}
-        <Card className="bg-white/80 dark:bg-slate-800/80 backdrop-blur shadow-lg border-0">
+        <Card className="bg-gradient-to-br from-sky-500 to-blue-600 text-white shadow-lg border-0">
           <CardHeader className="flex flex-row items-center justify-between pb-0">
-            <CardTitle className="text-sm font-medium text-gray-600 dark:text-gray-300">CPU</CardTitle>
-            <Cpu className="w-4 h-4 text-indigo-500" />
+            <CardTitle className="text-sm font-medium text-white/80">CPU</CardTitle>
+            <Cpu className="w-4 h-4 text-white" />
           </CardHeader>
           <CardContent className="pt-0 -mt-1">
-            <div className="text-2xl font-bold text-indigo-600">{formatPercent(systemData?.cpu?.load)}</div>
-            <p className="text-xs text-gray-500 dark:text-gray-400">
+            <div className="text-2xl font-bold text-white">{formatPercent(systemData?.cpu?.load)}</div>
+            <p className="text-xs text-white/80">
               {systemData?.cpu?.brand?.substring(0, 20) || 'CPU'} • {systemData?.cpu?.coresCount} 核
             </p>
           </CardContent>
         </Card>
 
         {/* 内存 */}
-        <Card className="bg-white/80 dark:bg-slate-800/80 backdrop-blur shadow-lg border-0">
+        <Card className="bg-gradient-to-br from-violet-500 to-purple-600 text-white shadow-lg border-0">
           <CardHeader className="flex flex-row items-center justify-between pb-0">
-            <CardTitle className="text-sm font-medium text-gray-600 dark:text-gray-300">内存</CardTitle>
-            <MemoryStick className="w-4 h-4 text-purple-500" />
+            <CardTitle className="text-sm font-medium text-white/80">内存</CardTitle>
+            <MemoryStick className="w-4 h-4 text-white" />
           </CardHeader>
           <CardContent className="pt-0 -mt-1">
-            <div className="text-2xl font-bold text-purple-600">{formatPercent(systemData?.memory?.usedPercent)}</div>
-            <p className="text-xs text-gray-500 dark:text-gray-400">
+            <div className="text-2xl font-bold text-white">{formatPercent(systemData?.memory?.usedPercent)}</div>
+            <p className="text-xs text-white/80">
               {formatBytes(systemData?.memory?.used)} / {formatBytes(systemData?.memory?.total)}
             </p>
           </CardContent>
         </Card>
 
         {/* 硬盘 */}
-        <Card className="bg-white/80 dark:bg-slate-800/80 backdrop-blur shadow-lg border-0">
+        <Card className="bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-lg border-0">
           <CardHeader className="flex flex-row items-center justify-between pb-0">
-            <CardTitle className="text-sm font-medium text-gray-600 dark:text-gray-300">硬盘</CardTitle>
-            <HardDrive className="w-4 h-4 text-pink-500" />
+            <CardTitle className="text-sm font-medium text-white/80">硬盘</CardTitle>
+            <HardDrive className="w-4 h-4 text-white" />
           </CardHeader>
           <CardContent className="pt-0 -mt-1">
-            <div className="text-2xl font-bold text-pink-600">
+            <div className="text-2xl font-bold text-white">
               {formatPercent(systemData?.mainDisk?.usedPercent)}
             </div>
-            <p className="text-xs text-gray-500 dark:text-gray-400">
+            <p className="text-xs text-white/80">
               {formatBytes(systemData?.mainDisk?.used)} / {formatBytes(systemData?.mainDisk?.total)}
             </p>
           </CardContent>
@@ -448,22 +474,22 @@ export default function Home() {
 
         {/* 温度 - 读取不到时不显示 */}
         {systemData?.temperature?.cpu && (
-          <Card className="bg-white/80 dark:bg-slate-800/80 backdrop-blur shadow-lg border-0">
+          <Card className="bg-gradient-to-br from-rose-500 to-red-600 text-white shadow-lg border-0">
             <CardHeader className="flex flex-row items-center justify-between pb-0">
-              <CardTitle className="text-sm font-medium text-gray-600 dark:text-gray-300">温度</CardTitle>
-              <Thermometer className="w-4 h-4 text-orange-500" />
+              <CardTitle className="text-sm font-medium text-white/80">温度</CardTitle>
+              <Thermometer className="w-4 h-4 text-white" />
             </CardHeader>
             <CardContent className="pt-0 -mt-1">
-              <div className="text-2xl font-bold text-orange-500">
+              <div className="text-2xl font-bold text-white">
                 {systemData.temperature.cpu}°C
               </div>
-              <p className="text-xs text-gray-500 dark:text-gray-400">CPU 温度</p>
+              <p className="text-xs text-white/80">CPU 温度</p>
             </CardContent>
           </Card>
         )}
 
         {/* OpenClaw 状态 */}
-        <Card className="bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-lg border-0">
+        <Card className="bg-gradient-to-br from-orange-500 to-amber-600 text-white shadow-lg border-0">
           <CardHeader className="flex flex-row items-center justify-between pb-0">
             <CardTitle className="text-sm font-medium text-white/80">OpenClaw</CardTitle>
             <Activity className="w-4 h-4 text-white" />
@@ -480,7 +506,7 @@ export default function Home() {
         </Card>
 
         {/* Gateway 状态 */}
-        <Card className="bg-gradient-to-br from-blue-500 to-cyan-600 text-white shadow-lg border-0">
+        <Card className="bg-gradient-to-br from-teal-500 to-cyan-600 text-white shadow-lg border-0">
           <CardHeader className="flex flex-row items-center justify-between pb-0">
             <CardTitle className="text-sm font-medium text-white/80">Gateway</CardTitle>
             <Activity className="w-4 h-4 text-white" />
@@ -497,7 +523,7 @@ export default function Home() {
         </Card>
 
         {/* Token 消耗 */}
-        <Card className="bg-gradient-to-br from-green-500 to-teal-600 text-white shadow-lg border-0">
+        <Card className="bg-gradient-to-br from-lime-500 to-emerald-600 text-white shadow-lg border-0">
           <CardHeader className="flex flex-row items-center justify-between pb-0">
             <CardTitle className="text-sm font-medium text-white/80">Token消耗</CardTitle>
             <Activity className="w-4 h-4 text-white" />
@@ -511,7 +537,7 @@ export default function Home() {
         </Card>
 
         {/* 今日Token消耗 */}
-        <Card className="bg-gradient-to-br from-amber-500 to-orange-600 text-white shadow-lg border-0">
+        <Card className="bg-gradient-to-br from-amber-500 to-yellow-600 text-white shadow-lg border-0">
           <CardHeader className="flex flex-row items-center justify-between pb-0">
             <CardTitle className="text-sm font-medium text-white/80">今日Token消耗</CardTitle>
             <Activity className="w-4 h-4 text-white" />
