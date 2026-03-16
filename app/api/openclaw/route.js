@@ -72,22 +72,23 @@ function parseGatewaySection(lines) {
   return gateways;
 }
 
-// ============== 缓存 ==============
-let cachedResult = null;
-let cacheTime = 0;
-const CACHE_TTL = 5000;
+// ============== 缓存（开发模式下禁用）===============
+const CACHE_TTL = 0; // 开发模式下禁用缓存
 
 // ============== 主 API ==============
 export async function GET() {
   try {
     const now = Date.now();
-    if (cachedResult && (now - cacheTime) < CACHE_TTL) {
+    const useCache = CACHE_TTL > 0;
+    if (useCache && cachedResult && (now - cacheTime) < CACHE_TTL) {
       return NextResponse.json(cachedResult);
     }
 
+const OPENCLAW_BIN = '/Volumes/SpaceShip/NPM_Data/npm-global/bin/openclaw';
+
     const [statusResult, sessionsResult, tokenResult, todayTokenResult] = await Promise.all([
-      execAsync('openclaw status 2>&1', { timeout: 10000 }),
-      execAsync('openclaw sessions --json', { timeout: 10000 }),
+      execAsync(`${OPENCLAW_BIN} status 2>&1`, { timeout: 10000 }),
+      execAsync(`${OPENCLAW_BIN} sessions --all-agents --json`, { timeout: 10000 }),
       Promise.resolve(calculateTotalTokensAllSessions()),
       calculateTodayTokens()
     ]);
@@ -103,8 +104,28 @@ export async function GET() {
 
     let sessions = [];
     try {
-      const data = JSON.parse(sessionsOutput);
-      sessions = data.sessions || [];
+      // openclaw 输出可能包含调试日志，需要提取 JSON 部分
+      let jsonStr = '';
+      let inJson = false;
+      let braceCount = 0;
+      
+      for (const char of sessionsOutput) {
+        if (char === '{') {
+          inJson = true;
+          braceCount = 1;
+        }
+        if (inJson) {
+          jsonStr += char;
+          if (char === '{') braceCount++;
+          if (char === '}') braceCount--;
+          if (braceCount === 0) break;
+        }
+      }
+      
+      if (jsonStr) {
+        const data = JSON.parse(jsonStr);
+        sessions = data.sessions || [];
+      }
     } catch (e) {
       // 解析失败，忽略
     }
@@ -148,8 +169,10 @@ export async function GET() {
       gatewayAddress: overview['Dashboard'] || 'N/A'
     };
 
-    cachedResult = summary;
-    cacheTime = now;
+    if (useCache) {
+      cachedResult = summary;
+      cacheTime = now;
+    }
 
     return NextResponse.json(summary);
   } catch (error) {

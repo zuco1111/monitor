@@ -4,6 +4,7 @@ import { promisify } from 'util';
 import { CronExpressionParser } from 'cron-parser';
 
 const execAsync = promisify(exec);
+const OPENCLAW_BIN = '/Volumes/SpaceShip/NPM_Data/npm-global/bin/openclaw';
 
 export const dynamic = 'force-dynamic';
 
@@ -46,43 +47,60 @@ function calculateNextRun(schedule) {
     });
     
     const next = interval.next();
-    const date = next.toDate();
+    // toDate() 返回 UTC 时间戳，在上海时区的服务器上用 getHours() 直接获取本地时间
+    const utcDate = next.toDate();
     
-    // 转换为上海时区显示
-    const formatter = new Intl.DateTimeFormat('zh-CN', {
-      timeZone: 'Asia/Shanghai',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false
-    });
+    const month = String(utcDate.getMonth() + 1).padStart(2, '0');
+    const day = String(utcDate.getDate()).padStart(2, '0');
+    const hour = String(utcDate.getHours()).padStart(2, '0');
+    const minute = String(utcDate.getMinutes()).padStart(2, '0');
     
-    return formatter.format(date);
+    return `${month}-${day} ${hour}:${minute}`;
   } catch (e) {
     console.error('Failed to parse cron:', e);
     return null;
   }
 }
 
-// 格式化时间为 mm-dd hh:mm（使用上海时区）
+// 格式化时间为 mm-dd hh-mm（使用上海时区）
+function formatDateTime(date, shanghaiTz = 'Asia/Shanghai') {
+  if (!date) return 'N/A';
+  const formatter = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: shanghaiTz,
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  });
+  return formatter.format(date).replace(/\//g, '-');
+}
+
+// 格式化时间为 mm-dd hh-mm（使用上海时区）
 function formatTime(timeStr) {
   if (!timeStr || timeStr === '-') return 'N/A';
   
   const shanghaiTz = 'Asia/Shanghai';
   
+  // "in 14m" 格式（下次执行时间）
+  const inMatch = timeStr.match(/^in\s+(\d+)([dhms])$/);
+  if (inMatch) {
+    const now = new Date();
+    const value = parseInt(inMatch[1]);
+    const unit = inMatch[2];
+    switch (unit) {
+      case 'd': now.setDate(now.getDate() + value); break;
+      case 'h': now.setHours(now.getHours() + value); break;
+      case 'm': now.setMinutes(now.getMinutes() + value); break;
+      case 's': now.setSeconds(now.getSeconds() + value); break;
+    }
+    return formatDateTime(now, shanghaiTz);
+  }
+  
   // 如果已经是具体日期时间格式
   if (timeStr.match(/^\d{4}-\d{2}-\d{2}/)) {
     const date = new Date(timeStr);
-    const formatter = new Intl.DateTimeFormat('zh-CN', {
-      timeZone: shanghaiTz,
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false
-    });
-    return formatter.format(date);
+    return formatDateTime(date, shanghaiTz);
   }
   
   // "5d ago" 格式
@@ -97,15 +115,7 @@ function formatTime(timeStr) {
       case 'm': now.setMinutes(now.getMinutes() - value); break;
       case 's': now.setSeconds(now.getSeconds() - value); break;
     }
-    const formatter = new Intl.DateTimeFormat('zh-CN', {
-      timeZone: shanghaiTz,
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false
-    });
-    return formatter.format(now);
+    return formatDateTime(now, shanghaiTz);
   }
   
   return timeStr;
@@ -113,7 +123,7 @@ function formatTime(timeStr) {
 
 export async function GET() {
   try {
-    const { stdout: listOutput } = await execAsync('openclaw cron list', {
+    const { stdout: listOutput } = await execAsync(`${OPENCLAW_BIN} cron list`, {
       timeout: 10000
     });
 
@@ -134,8 +144,11 @@ export async function GET() {
       const lastRun = line.substring(106, 117).trim();
       const status = line.substring(117, 127).trim();
       
-      // 过滤掉非任务的行
-      if (!id || id.length < 10 || id.includes('$') || id.includes('zuco')) continue;
+      // 过滤掉非任务的行（插件日志、测试行等）
+      if (!id || id.length < 36 || id.includes('$') || id.includes('zuco') || id.includes('[') || id.includes('plugins')) continue;
+      
+      // 验证 id 格式（UUID 应该是 36 位）
+      if (!id.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) continue;
       
       // 计算精确的下次执行时间
       const calculatedNextRun = calculateNextRun(schedule);

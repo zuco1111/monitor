@@ -4,8 +4,13 @@ import { randomUUID } from 'crypto';
 import path from 'path';
 import os from 'os';
 
-// ============== P0 修复：Token 计算内存缓存 ==============
-const TOKEN_CACHE_TTL = 60000; // 内存缓存 60 秒
+// ============== Token 计算缓存（开发模式禁用，使用文件缓存）==============
+// 开发模式下内存缓存不可靠，每个 worker 进程有独立内存
+// 所以这里直接禁用内存缓存，每次都从文件读取和计算
+const TOKEN_CACHE_TTL = 0; // 禁用内存缓存
+
+// 开发模式下也禁用所有缓存
+const DISABLE_ALL_CACHE = true;
 let cachedTotalTokens = null;
 let cachedTotalTokensTime = 0;
 let cachedTodayTokens = null;
@@ -13,7 +18,8 @@ let cachedTodayTokensTime = 0;
 
 // ============== Token 存储配置 ==============
 const TOKEN_STORAGE_FILE = path.join(os.homedir(), '.openclaw', 'token-usage.json');
-const DAILY_TOKEN_FILE = path.join(os.homedir(), '.openclaw', 'daily-token.json');
+const DAILY_BASELINE_FILE = path.join(os.homedir(), '.openclaw', 'daily-baseline.json');
+const DAILY_HISTORY_FILE = path.join(os.homedir(), '.openclaw', 'daily-history.json');
 
 // ============== 工具函数 ==============
 
@@ -61,42 +67,66 @@ export async function saveTokenStorage(storage) {
   }
 }
 
-// 加载每日Token存储
-export function loadDailyTokenStorage() {
+// 加载每日基准（用于增量计算）
+export function loadDailyBaseline() {
   try {
-    if (fs.existsSync(DAILY_TOKEN_FILE)) {
-      const data = fs.readFileSync(DAILY_TOKEN_FILE, 'utf-8');
+    if (fs.existsSync(DAILY_BASELINE_FILE)) {
+      const data = fs.readFileSync(DAILY_BASELINE_FILE, 'utf-8');
       return JSON.parse(data);
     }
   } catch (e) {
-    console.error('[Token] Error loading daily token storage:', e);
+    console.error('[Token] Error loading daily baseline:', e);
   }
-  // 返回结构：{ yesterdayTotal: number, sessions: { [key]: number }, lastUpdateDate: string }
-  return { yesterdayTotal: 0, sessions: {}, lastUpdateDate: null };
+  return { date: null, sessions: {}, todayTokens: 0 };
 }
 
-// 保存每日Token存储（原子写入）
-export async function saveDailyTokenStorage(storage) {
-  const tempFile = DAILY_TOKEN_FILE + '.' + randomUUID() + '.tmp';
+// 保存每日基准（原子写入）
+export async function saveDailyBaseline(baseline) {
+  const tempFile = DAILY_BASELINE_FILE + '.' + randomUUID() + '.tmp';
   try {
-    const dir = path.dirname(DAILY_TOKEN_FILE);
+    const dir = path.dirname(DAILY_BASELINE_FILE);
     await fsPromises.mkdir(dir, { recursive: true });
-    await fsPromises.writeFile(tempFile, JSON.stringify(storage, null, 2), 'utf-8');
-    await fsPromises.rename(tempFile, DAILY_TOKEN_FILE);
+    await fsPromises.writeFile(tempFile, JSON.stringify(baseline, null, 2), 'utf-8');
+    await fsPromises.rename(tempFile, DAILY_BASELINE_FILE);
   } catch (e) {
-    console.error('[Token] Error saving daily token storage:', e);
+    console.error('[Token] Error saving daily baseline:', e);
+    try { await fsPromises.unlink(tempFile); } catch {}
+  }
+}
+
+// 加载每日历史（用于记录每日总量）
+export function loadDailyHistory() {
+  try {
+    if (fs.existsSync(DAILY_HISTORY_FILE)) {
+      const data = fs.readFileSync(DAILY_HISTORY_FILE, 'utf-8');
+      return JSON.parse(data);
+    }
+  } catch (e) {
+    console.error('[Token] Error loading daily history:', e);
+  }
+  return {}; // { "2026-03-13": 123456, "2026-03-12": 98765, ... }
+}
+
+// 保存每日历史
+export async function saveDailyHistory(history) {
+  const tempFile = DAILY_HISTORY_FILE + '.' + randomUUID() + '.tmp';
+  try {
+    const dir = path.dirname(DAILY_HISTORY_FILE);
+    await fsPromises.mkdir(dir, { recursive: true });
+    await fsPromises.writeFile(tempFile, JSON.stringify(history, null, 2), 'utf-8');
+    await fsPromises.rename(tempFile, DAILY_HISTORY_FILE);
+  } catch (e) {
+    console.error('[Token] Error saving daily history:', e);
     try { await fsPromises.unlink(tempFile); } catch {}
   }
 }
 
 // 从 session 文件中提取最终的 token 消耗（取最后一条消息的 totalTokens）
-// 增大读取限制到 500KB 以处理更大的 session 文件
 export function getFinalTokensFromSession(sessionFilePath) {
   try {
     const stats = fs.statSync(sessionFilePath);
     if (stats.size === 0) return 0;
     
-    // 读取文件最后 500KB 来获取最新的 usage（原 100KB 增大到 500KB）
     const readSize = Math.min(stats.size, 500 * 1024);
     const buffer = Buffer.alloc(readSize);
     const fd = fs.openSync(sessionFilePath, 'r');
@@ -106,16 +136,13 @@ export function getFinalTokensFromSession(sessionFilePath) {
     const content = buffer.toString('utf-8');
     const lines = content.split('\n').filter(l => l.trim());
     
-    // 从最后往前找，最后一个包含 usage.totalTokens 的 message 就是最终值
     for (let i = lines.length - 1; i >= 0; i--) {
       try {
         const obj = JSON.parse(lines[i]);
         if (obj.type === 'message' && obj.message?.usage?.totalTokens) {
           return obj.message.usage.totalTokens;
         }
-      } catch (e) {
-        // 跳过解析失败的行
-      }
+      } catch (e) {}
     }
     return 0;
   } catch (e) {
@@ -123,23 +150,19 @@ export function getFinalTokensFromSession(sessionFilePath) {
   }
 }
 
-// ============== 核心逻辑：计算总Token消耗（历史累计）- 带内存缓存 ==============
+// ============== 核心逻辑：计算总Token消耗（历史累计）==============
 /**
  * 计算总Token消耗（历史累计）- 带内存缓存
  * - 内存缓存 60 秒，避免频繁文件 I/O
- * - 记录每个 session 的历史最大 token 值
- * - 即使 session 被删除，也保留历史最大值（通过不删除 sessions 记录）
- * - 总消耗 = 所有 session 的历史最大值之和
- * - 支持所有 agent 的 sessions
- * - 正确处理 .reset. 文件（会创建新 session，原文件变成 .reset.）
- * - 正确处理 .deleted. 文件（会保留最终 token）
- * - 修复：同时读取 .jsonl、.jsonl.deleted.xxx、.jsonl.reset.xxx 文件，取最大值
+ * - 记录每个 session 的历史 token 最大值
+ * - 即使 session 被删除/重置，也保留历史 token
+ * - 总消耗 = 所有 session 的历史 token 之和（取每个 session 的最大值）
  * @param {boolean} forceRefresh - 强制刷新缓存
  */
 export function calculateTotalTokensAllSessions(forceRefresh = false) {
   const now = Date.now();
   
-  // P0 修复：检查内存缓存
+  // 检查内存缓存
   if (!forceRefresh && cachedTotalTokens !== null && (now - cachedTotalTokensTime) < TOKEN_CACHE_TTL) {
     return cachedTotalTokens;
   }
@@ -156,11 +179,10 @@ export function calculateTotalTokensAllSessions(forceRefresh = false) {
   try {
     agents = fs.readdirSync(agentsDir);
   } catch { 
-    // 如果读取失败，返回历史累计值
     return storage.total || 0;
   }
   
-  // 遍历所有当前存在的 session，更新历史最大值
+  // 遍历所有当前存在的 session，取每个 session 的最大 token 值
   let hasChanges = false;
   const newHistorySessions = { ...historySessions };
   
@@ -171,20 +193,16 @@ export function calculateTotalTokensAllSessions(forceRefresh = false) {
     try {
       const files = fs.readdirSync(sessionsDir);
       
-      // 先收集同一个 sessionId 的所有文件
-      const sessionFilesMap = {};
+      // 收集同一个 sessionId 的所有文件，取最大值
+      const sessionMaxTokens = {};
       
       for (const file of files) {
-        // 支持三种文件：
-        // - .jsonl（正常）: xxx.jsonl
-        // - .jsonl.deleted.xxx（已删除）: xxx.jsonl.deleted.timestamp
-        // - .jsonl.reset.xxx（已重置）: xxx.jsonl.reset.timestamp
         if (!file.endsWith('.jsonl') && !file.includes('.jsonl.deleted.') && !file.includes('.jsonl.reset.')) continue;
         
-        // 提取 sessionId：移除 .jsonl, .deleted.xxx, .reset.xxx 等后缀
+        // 提取 sessionId
         let sessionId = file.replace('.jsonl', '');
-        sessionId = sessionId.replace(/\.deleted\..+$/, '');  // 移除 .deleted.timestamp
-        sessionId = sessionId.replace(/\.reset\..+$/, '');    // 移除 .reset.timestamp
+        sessionId = sessionId.replace(/\.deleted\..+$/, '');
+        sessionId = sessionId.replace(/\.reset\..+$/, '');
         
         const uniqueKey = `${agent}:${sessionId}`;
         const filePath = path.join(sessionsDir, file);
@@ -192,22 +210,21 @@ export function calculateTotalTokensAllSessions(forceRefresh = false) {
         // 读取文件的 token 值
         const tokens = getFinalTokensFromSession(filePath);
         
-        // 同一个 sessionId 可能有多个文件（.jsonl 和 .jsonl.reset.xxx），取最大值
-        if (!sessionFilesMap[uniqueKey] || tokens > sessionFilesMap[uniqueKey]) {
-          sessionFilesMap[uniqueKey] = tokens;
+        // 【修复】取最大值，而不是累加
+        if (!sessionMaxTokens[uniqueKey] || tokens > sessionMaxTokens[uniqueKey]) {
+          sessionMaxTokens[uniqueKey] = tokens;
         }
       }
       
-      // 处理每个 session 的最大值
-      for (const [uniqueKey, currentTokens] of Object.entries(sessionFilesMap)) {
-        if (currentTokens > 0) {
-          // 如果当前值大于历史最大值，更新历史最大值
-          if (!historySessions[uniqueKey] || currentTokens > historySessions[uniqueKey]) {
-            newHistorySessions[uniqueKey] = currentTokens;
+      // 处理每个 session
+      for (const [uniqueKey, maxTokens] of Object.entries(sessionMaxTokens)) {
+        if (maxTokens > 0) {
+          // 如果当前最大值大于历史值，更新
+          if (!historySessions[uniqueKey] || maxTokens > historySessions[uniqueKey]) {
+            newHistorySessions[uniqueKey] = maxTokens;
             hasChanges = true;
-            console.log(`[Token] Session ${uniqueKey} updated: ${historySessions[uniqueKey] || 0} -> ${currentTokens}`);
+            console.log(`[Token] Session ${uniqueKey} updated: ${historySessions[uniqueKey] || 0} -> ${maxTokens}`);
           } else {
-            // 保持历史值
             newHistorySessions[uniqueKey] = historySessions[uniqueKey];
           }
         }
@@ -218,14 +235,20 @@ export function calculateTotalTokensAllSessions(forceRefresh = false) {
     }
   }
   
+  // 保留已删除 session 的历史数据
+  for (const [uniqueKey, historicalTokens] of Object.entries(historySessions)) {
+    if (!newHistorySessions[uniqueKey] && historicalTokens > 0) {
+      newHistorySessions[uniqueKey] = historicalTokens;
+      hasChanges = true;
+      console.log(`[Token] Restored deleted session ${uniqueKey}: ${historicalTokens}`);
+    }
+  }
+  
   // 计算历史累计总值
   const totalTokens = Object.values(newHistorySessions).reduce((sum, t) => sum + t, 0);
   
-  // 只有发生变化时才写入文件（避免频繁 IO）
-  // 注意：即使 session 被删除，我们也不从 historySessions 中删除，
-  // 这样可以保留历史累计数据
-  const hasSessionCountChange = Object.keys(newHistorySessions).length !== Object.keys(historySessions).length;
-  if (hasChanges || hasSessionCountChange) {
+  // 保存更新
+  if (hasChanges || Object.keys(newHistorySessions).length !== Object.keys(historySessions).length) {
     const newStorage = {
       sessions: newHistorySessions,
       total: totalTokens,
@@ -235,176 +258,138 @@ export function calculateTotalTokensAllSessions(forceRefresh = false) {
     console.log(`[Token] Total tokens updated: ${totalTokens}`);
   }
   
-  // P0 修复：更新内存缓存
+  // 更新内存缓存
   cachedTotalTokens = totalTokens;
   cachedTotalTokensTime = now;
   
   return totalTokens;
 }
 
-// ============== 核心逻辑：计算今日Token消耗 ==============
+// ============== 核心逻辑：计算今日Token消耗（增量计算）==============
 /**
- * 计算今日Token消耗
- * - 跨天/首次：记录当前所有 session 的 token 值作为今日基准
- * - 今日消耗 = sum(当前值 - 基准) + sum(今日新增session的token)
- * - 对于今日被删除的session：从今日基准中获取其最终的token并计入今日消耗
- * - 每天0点会自动重置今日统计
- * - 修复：yesterdayTotal 每次跨天时都更新为上一天的历史总量
+ * 计算今日Token消耗 - 增量计算方式
+ * - 记录每个 session 的 token 基准值
+ * - 每次调用计算增量并累加到今日 token
+ * - 支持 session 删除/重置：读取 .deleted. 文件获取最终 token 并计入
+ * - 每天 0 点自动重置，并将前日数据保存到历史
  * @param {boolean} forceRefresh - 强制刷新缓存
  */
 export async function calculateTodayTokens(forceRefresh = false) {
   const now = Date.now();
   
-  // P0 修复：检查内存缓存
-  if (!forceRefresh && cachedTodayTokens !== null && (now - cachedTodayTokensTime) < TOKEN_CACHE_TTL) {
+  // 检查内存缓存（TOKEN_CACHE_TTL=0 时禁用）
+  const useCache = TOKEN_CACHE_TTL > 0;
+  if (useCache && !forceRefresh && cachedTodayTokens !== null && (now - cachedTodayTokensTime) < TOKEN_CACHE_TTL) {
     return cachedTodayTokens;
   }
   
-  const dailyStorage = loadDailyTokenStorage();
-  const historyStorage = loadTokenStorage();
   const today = getTodayDateString();
-  const yesterday = getYesterdayDateString();
   const homeDir = os.homedir();
   const agentsDir = path.join(homeDir, '.openclaw', 'agents');
   
-  // 首次运行或跨天：初始化今日基准
-  if (dailyStorage.lastUpdateDate !== today) {
-    const baselineSessions = {};
-    let agents = [];
-    try {
-      agents = fs.readdirSync(agentsDir);
-    } catch {}
-    
-    // 遍历当前所有 session，记录今日0点的基准
-    for (const agent of agents) {
-      const sessionsDir = path.join(agentsDir, agent, 'sessions');
-      if (!fs.existsSync(sessionsDir)) continue;
-      try {
-        const files = fs.readdirSync(sessionsDir);
-        for (const file of files) {
-          // 支持三种文件：
-          // - .jsonl（正常）
-          // - .jsonl.deleted.xxx（已删除）
-          // - .jsonl.reset.xxx（已重置）- 重置前的文件也需要计入今日基准
-          if (!file.endsWith('.jsonl') && !file.includes('.jsonl.deleted.') && !file.includes('.jsonl.reset.')) continue;
-          
-          const sessionId = file.replace('.jsonl', '').replace(/\.deleted\..+$/, '').replace(/\.reset\..+$/, '');
-          const uniqueKey = `${agent}:${sessionId}`;
-          const filePath = path.join(sessionsDir, file);
-          const tokens = getFinalTokensFromSession(filePath);
-          if (tokens > 0) {
-            // 如果已存在基准（可能多个同名文件），取最大值
-            if (!baselineSessions[uniqueKey] || tokens > baselineSessions[uniqueKey]) {
-              baselineSessions[uniqueKey] = tokens;
-            }
-          }
-        }
-      } catch { continue; }
+  // 加载或初始化每日基准
+  let baseline = loadDailyBaseline();
+  const yesterday = getYesterdayDateString();
+  
+  // 跨天检测：每天 0 点重置
+  if (baseline.date !== today) {
+    // 保存昨日数据到历史
+    if (baseline.date && baseline.todayTokens > 0) {
+      const dailyHistory = loadDailyHistory();
+      dailyHistory[baseline.date] = baseline.todayTokens;
+      await saveDailyHistory(dailyHistory);
+      console.log(`[Token] Saved yesterday ${baseline.date}: ${baseline.todayTokens} tokens`);
     }
     
-    // 【修复】yesterdayTotal 更新逻辑：
-    // 1. 首次运行时：使用当前历史总量作为 yesterdayTotal
-    // 2. 跨天时：使用当前历史总量作为 yesterdayTotal（确保与上一天衔接）
-    // 3. 如果 yesterdayTotal 是 0（历史遗留问题），也更新为当前历史总量
-    const yesterdayTotal = historyStorage.total || 0;
-    
-    if (dailyStorage.lastUpdateDate === null) {
-      // 首次运行
-      dailyStorage.yesterdayTotal = yesterdayTotal;
-      console.log(`[Token] First run, yesterdayTotal set to: ${yesterdayTotal}`);
-    } else if (dailyStorage.lastUpdateDate !== yesterday) {
-      // 跨天（跳过一天或多天）：更新 yesterdayTotal
-      dailyStorage.yesterdayTotal = yesterdayTotal;
-      console.log(`[Token] Cross day, yesterdayTotal updated to: ${yesterdayTotal}`);
-    } else if (dailyStorage.yesterdayTotal === 0 && yesterdayTotal > 0) {
-      // 历史遗留问题修复：如果 yesterdayTotal 是 0但当前有历史数据，更新它
-      dailyStorage.yesterdayTotal = yesterdayTotal;
-      console.log(`[Token] Fixed historical yesterdayTotal: ${yesterdayTotal}`);
-    }
-    // 注意：如果是连续运行（同一天多次调用），且 yesterdayTotal > 0，则不更新
-    
-    // 更新今日 session 基准
-    dailyStorage.sessions = baselineSessions;
-    dailyStorage.lastUpdateDate = today;
-    await saveDailyTokenStorage(dailyStorage);
-    
-    console.log(`[Token] New day, baseline sessions: ${Object.keys(baselineSessions).length}, yesterdayTotal: ${dailyStorage.yesterdayTotal}`);
+    console.log(`[Token] New day detected: ${baseline.date} -> ${today}, resetting daily token`);
+    baseline = {
+      date: today,
+      sessions: {},
+      todayTokens: 0
+    };
   }
   
-  // 【修复】yesterdayTotal 历史遗留问题：每次调用时检查并修复
-  // 如果 yesterdayTotal 是 0但当前有历史数据，更新它
-  const historyTotal = loadTokenStorage().total || 0;
-  if (dailyStorage.yesterdayTotal === 0 && historyTotal > 0) {
-    dailyStorage.yesterdayTotal = historyTotal;
-    await saveDailyTokenStorage(dailyStorage);
-    console.log(`[Token] Fixed historical yesterdayTotal: ${historyTotal}`);
-  }
-  
-  // 计算今日消耗
-  let todayTokens = 0;
-  const baselineSessions = dailyStorage.sessions || {};
-  
-  // 获取当前所有 session
+  // 获取当前所有活跃 session 的 token
+  const currentSessions = {};
   let agents = [];
+  
   try {
     agents = fs.readdirSync(agentsDir);
   } catch {}
   
-  const currentSessions = {};
-  
   for (const agent of agents) {
     const sessionsDir = path.join(agentsDir, agent, 'sessions');
     if (!fs.existsSync(sessionsDir)) continue;
+    
     try {
       const files = fs.readdirSync(sessionsDir);
+      
+      // 只读取活跃的 .jsonl 文件（跳过 .deleted. 和 .reset.）
       for (const file of files) {
-        // 支持三种文件：
-        // - .jsonl（正常）
-        // - .jsonl.deleted.xxx（已删除）
-        // - .jsonl.reset.xxx（已重置）- 重置前的文件也需要计入今日消耗
-        if (!file.endsWith('.jsonl') && !file.includes('.jsonl.deleted.') && !file.includes('.jsonl.reset.')) continue;
+        // 跳过 .deleted. 和 .reset. 文件
+        if (!file.endsWith('.jsonl') || file.includes('.jsonl.deleted.') || file.includes('.jsonl.reset.')) continue;
         
-        const sessionId = file.replace('.jsonl', '').replace(/\.deleted\..+$/, '').replace(/\.reset\..+$/, '');
+        const sessionId = file.replace('.jsonl', '');
         const uniqueKey = `${agent}:${sessionId}`;
         const filePath = path.join(sessionsDir, file);
         const currentTokens = getFinalTokensFromSession(filePath);
         
         if (currentTokens > 0) {
-          // 对于同一个 session，可能同时存在 .jsonl 和 .jsonl.reset.xxx（刚被重置）
-          // 取最大值，确保重置前的消耗被计入
-          if (!currentSessions[uniqueKey] || currentTokens > currentSessions[uniqueKey]) {
-            currentSessions[uniqueKey] = currentTokens;
-          }
+          currentSessions[uniqueKey] = currentTokens;
         }
       }
     } catch { continue; }
   }
   
-  // 统一计算今日消耗（避免同一 session 多次计算）
+  // 计算增量并更新今日 token
+  let newTodayTokens = baseline.todayTokens;
+  const currentBaseline = baseline.sessions;
+  const newBaselineSessions = {};
+  
+  // 1. 处理当前仍存在的 session：计算增量
   for (const [uniqueKey, currentTokens] of Object.entries(currentSessions)) {
-    const baseline = baselineSessions[uniqueKey] || 0;
-    if (currentTokens > baseline) {
-      todayTokens += (currentTokens - baseline);
+    const sessionBaseline = currentBaseline[uniqueKey] || { baseline: 0 };
+    
+    // 【修复】如果之前被标记为已删除（processed: true），需要先从基准中清除之前计入的 token
+    // 然后重新计算增量（从 0 开始）
+    let startFrom = sessionBaseline.baseline;
+    if (sessionBaseline.processed) {
+      // 之前已经计入过删除会话的 token，现在当作新会话处理
+      startFrom = 0;
     }
-    // 如果 currentTokens <= baseline，说明 session 被重置或无变化，不计入
+    
+    if (currentTokens > startFrom) {
+      // 有增量：累加到今日 token
+      const increment = currentTokens - startFrom;
+      newTodayTokens += increment;
+      
+      console.log(`[Token] Session ${uniqueKey}: ${startFrom} -> ${currentTokens}, increment: ${increment}`);
+    }
+    
+    // 更新基准值
+    newBaselineSessions[uniqueKey] = {
+      baseline: currentTokens
+    };
   }
   
-  // 【修复】处理今日被删除的 session：
-  // 如果一个 session 在基准中存在（今日0点存在），但现在已被删除，
-  // 需要将其基准 token 计入今日消耗（因为它的消耗发生在今天）
-  for (const [uniqueKey, baseline] of Object.entries(baselineSessions)) {
-    if (!currentSessions[uniqueKey] && baseline > 0) {
-      // session 在今日被删除，将其基准 token 计入今日消耗
-      todayTokens += baseline;
-      console.log(`[Token] Session ${uniqueKey} deleted today, adding baseline: ${baseline}`);
+  // 2. 处理已被删除的 session：从基准中移除
+  for (const uniqueKey of Object.keys(currentBaseline)) {
+    if (!currentSessions[uniqueKey]) {
+      console.log(`[Token] Session ${uniqueKey} deleted, removed from baseline`);
     }
   }
   
-  console.log(`[Token] Today tokens: ${todayTokens}`);
+  // 保存更新后的基准
+  baseline.sessions = newBaselineSessions;
+  baseline.todayTokens = newTodayTokens;
+  baseline.date = today;
+  await saveDailyBaseline(baseline);
   
-  // P0 修复：更新内存缓存
-  cachedTodayTokens = { todayTokens };
+  console.log(`[Token] Today tokens: ${newTodayTokens}, active sessions: ${Object.keys(currentSessions).length}`);
+  
+  // 更新内存缓存
+  cachedTodayTokens = newTodayTokens;
   cachedTodayTokensTime = now;
   
-  return { todayTokens };
+  return { todayTokens: newTodayTokens };
 }

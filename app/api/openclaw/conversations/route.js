@@ -6,6 +6,7 @@ import path from 'path';
 import os from 'os';
 
 const execAsync = promisify(exec);
+const OPENCLAW_BIN = '/Volumes/SpaceShip/NPM_Data/npm-global/bin/openclaw';
 
 export const dynamic = 'force-dynamic';
 
@@ -68,13 +69,31 @@ export async function GET(request) {
     const after = searchParams.get('after'); // 可选的时间戳，用于增量获取
 
     // 获取所有 session 列表（包含所有 agent）
-    const { stdout } = await execAsync('openclaw sessions --all-agents --json', {
+    const { stdout, stderr } = await execAsync(`${OPENCLAW_BIN} sessions --all-agents --json`, {
       timeout: 10000
     });
 
     let data;
     try {
-      data = JSON.parse(stdout);
+      // openclaw 输出可能包含调试日志，需要提取 JSON 部分
+      let jsonStr = '';
+      let inJson = false;
+      let braceCount = 0;
+      
+      for (const char of stdout) {
+        if (char === '{') {
+          inJson = true;
+          braceCount = 1;
+        }
+        if (inJson) {
+          jsonStr += char;
+          if (char === '{') braceCount++;
+          if (char === '}') braceCount--;
+          if (braceCount === 0) break;
+        }
+      }
+      
+      data = jsonStr ? JSON.parse(jsonStr) : { sessions: [] };
     } catch (e) {
       data = { sessions: [] };
     }

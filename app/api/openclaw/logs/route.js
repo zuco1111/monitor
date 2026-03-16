@@ -3,6 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
+const OPENCLAW_BIN = '/Volumes/SpaceShip/NPM_Data/npm-global/bin/openclaw';
 
 export const dynamic = 'force-dynamic';
 
@@ -15,7 +16,7 @@ export async function GET(request) {
 
     // 获取日志（带超时保护）
     const { stdout } = await execAsync(
-      `openclaw logs --json --limit ${limit} --plain`,
+      `${OPENCLAW_BIN} logs --json --limit ${limit} --plain`,
       { timeout: 10000 }
     );
 
