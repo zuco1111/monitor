@@ -86,12 +86,22 @@ export async function GET() {
 
 const OPENCLAW_BIN = '/Volumes/SpaceShip/NPM_Data/npm-global/bin/openclaw';
 
-    const [statusResult, sessionsResult, tokenResult, todayTokenResult] = await Promise.all([
+    const [statusResult, sessionsResult, tokenResult, todayTokenResult, probeResult] = await Promise.all([
       execAsync(`${OPENCLAW_BIN} status 2>&1`, { timeout: 10000 }),
       execAsync(`${OPENCLAW_BIN} sessions --all-agents --json`, { timeout: 10000 }),
       Promise.resolve(calculateTotalTokensAllSessions()),
-      calculateTodayTokens()
+      calculateTodayTokens(),
+      execAsync(`${OPENCLAW_BIN} gateway probe 2>&1`, { timeout: 10000 }).catch(() => ({ stdout: '' }))
     ]);
+
+    // 从 gateway probe 解析延迟
+    let probeLatency = 'N/A';
+    if (probeResult.stdout) {
+      const latencyMatch = probeResult.stdout.match(/Connect:\s*ok\s*\((\d+)ms\)/);
+      if (latencyMatch) {
+        probeLatency = latencyMatch[1] + 'ms';
+      }
+    }
 
     const { stdout } = statusResult;
     const { stdout: sessionsOutput } = sessionsResult;
@@ -139,9 +149,10 @@ const OPENCLAW_BIN = '/Volumes/SpaceShip/NPM_Data/npm-global/bin/openclaw';
     const activeSessions = sessionsMatch ? parseInt(sessionsMatch[1]) : 0;
 
     const gatewayInfo = overview['Gateway'] || '';
-    const gatewayReachable = gatewayInfo.includes('reachable');
+    // 简化逻辑：有延时=可达，无延时=不可达
+    const gatewayReachable = probeLatency !== 'N/A';
     const gatewayMsMatch = gatewayInfo.match(/reachable\s+(\d+)ms/);
-    const gatewayLatency = gatewayMsMatch ? gatewayMsMatch[1] + 'ms' : 'N/A';
+    const gatewayLatency = probeLatency !== 'N/A' ? probeLatency : (gatewayMsMatch ? gatewayMsMatch[1] + 'ms' : 'N/A');
     
     const heartbeatInfo = overview['Heartbeat'] || '';
     const memoryInfo = overview['Memory'] || '';

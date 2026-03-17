@@ -106,12 +106,22 @@ function parseGatewaySection(lines) {
 
 // ============== OpenClaw 状态抓取 ==============
 async function fetchOpenClawStatus() {
-  const [statusResult, sessionsResult, tokenResult, todayTokenResult] = await Promise.all([
+  const [statusResult, sessionsResult, tokenResult, todayTokenResult, probeResult] = await Promise.all([
     execAsync(`${OPENCLAW_BIN} status 2>&1`, { timeout: 10000 }),
     execAsync(`${OPENCLAW_BIN} sessions --all-agents --json`, { timeout: 10000 }),
     Promise.resolve({ totalTokens: calculateTotalTokensAllSessions() }),
-    calculateTodayTokens()
+    calculateTodayTokens(),
+    execAsync(`${OPENCLAW_BIN} gateway probe 2>&1`, { timeout: 10000 }).catch(() => ({ stdout: '' }))
   ]);
+
+  // 从 gateway probe 解析延迟
+  let probeLatency = 'N/A';
+  if (probeResult.stdout) {
+    const latencyMatch = probeResult.stdout.match(/Connect:\s*ok\s*\((\d+)ms\)/);
+    if (latencyMatch) {
+      probeLatency = latencyMatch[1] + 'ms';
+    }
+  }
 
   const lines = statusResult.stdout.split('\n');
   const overview = parseOverview(lines);
@@ -160,8 +170,15 @@ async function fetchOpenClawStatus() {
     model: sessions[0]?.model || 'N/A',
     heartbeat: overview['Heartbeat'] || '',
     memory: overview['Memory'] || '',
-    gatewayReachable: (overview['Gateway'] || '').includes('reachable'),
-    gatewayLatency: (overview['Gateway'] || '').match(/reachable\s+(\d+)ms/)?.[1] + 'ms' || 'N/A',
+    // 简化逻辑：有延时=可达，无延时=不可达
+    // 先计算 latency，再统一判断
+    const fallbackLatency = (() => {
+      const match = (overview['Gateway'] || '').match(/reachable\s*\(?(\d+)ms\)?/);
+      return match ? match[1] + 'ms' : 'N/A';
+    })();
+    const finalLatency = probeLatency !== 'N/A' ? probeLatency : fallbackLatency;
+    gatewayReachable: finalLatency !== 'N/A',
+    gatewayLatency: finalLatency,
     dashboard: overview['Dashboard'] || 'N/A'
   };
 }
