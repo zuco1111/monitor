@@ -14,7 +14,6 @@ case "$MODE" in
     ;;
   start)
     echo "🚀 生产模式启动..."
-    npm run build
     npm run start
     ;;
   pm2)
@@ -22,6 +21,11 @@ case "$MODE" in
     if ! command -v pm2 &> /dev/null; then
       echo "❌ PM2 未安装，请先运行: npm install -g pm2"
       exit 1
+    fi
+    # 先确保已经 build 过（不要每次 rebuild）
+    if [ ! -d ".next" ]; then
+      echo "📦 首次启动，执行 build..."
+      npm run build
     fi
     pm2 start ecosystem.config.js
     pm2 save
@@ -34,16 +38,22 @@ case "$MODE" in
     pm2 stop monitor 2>/dev/null || echo "Monitor 未在运行"
     ;;
   restart)
-    echo "🔄 重启 Monitor..."
+    echo "🔄 重启 PM2..."
     pm2 restart monitor
     ;;
+  rebuild)
+    echo "🔨 执行 build..."
+    npm run build
+    echo "✅ Build 完成"
+    ;;
   *)
-    echo "用法: $0 [dev|start|pm2|stop|restart]"
+    echo "用法: $0 [dev|start|pm2|stop|restart|rebuild]"
     echo "  dev    - 开发模式 (热重载)"
     echo "  start  - 生产模式"
     echo "  pm2    - PM2 守护进程模式"
     echo "  stop   - 停止 PM2"
     echo "  restart- 重启 PM2"
+    echo "  rebuild- 重新构建（仅首次或更新后需要）"
     exit 1
     ;;
 esac

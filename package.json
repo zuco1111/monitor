@@ -20,7 +20,6 @@
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "recharts": "^3.7.0",
-    "rotating-file-stream": "^3.2.9",
     "systeminformation": "^5.31.3",
     "tailwind-merge": "^3.5.0"
   },
